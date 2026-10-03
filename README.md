@@ -1,4 +1,4 @@
-# recursive_lean_prover
+# recursive_lean_prover _(flow-recursive-lean-prover)_
 
 Recursive Lean Prover for hmz: recursively plan, prove, compare, review and catalogue Lean theorems.
 

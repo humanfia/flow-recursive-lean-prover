@@ -34,13 +34,32 @@ IGNORED = shutil.ignore_patterns("__pycache__")
 
 
 def interface(flow: Any) -> dict[str, Any]:
-    """What a caller of a flow depends on: its roles, environments and params' defaults."""
+    """What a caller of a flow depends on: whether it resumes, what each role must be, and
+    each param's type and default."""
     declared = flow.describe()
     return {
-        "agents": [(role.name, role.auto) for role in declared.agents],
-        "envs": [role.name for role in declared.envs],
+        "resumable": declared.resumable,
+        "agents": [
+            (
+                role.name,
+                role.auto,
+                role.required,
+                role.harness,
+                sorted(one.__qualname__ for one in role.capabilities),
+                role.permission,
+            )
+            for role in declared.agents
+        ],
+        "envs": [
+            (
+                role.name,
+                role.auto,
+                sorted(one.__qualname__ for one in role.capabilities),
+            )
+            for role in declared.envs
+        ],
         "params": {
-            name: field.get_default(call_default_factory=True)
+            name: (repr(field.annotation), field.get_default(call_default_factory=True))
             for name, field in declared.params.model_fields.items()
         },
     }
