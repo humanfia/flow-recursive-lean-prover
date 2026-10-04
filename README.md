@@ -106,15 +106,16 @@ offline-reproducible and prevents Lake from trying to update shared read-only Gi
 
 You need [hmz](https://github.com/humanfia/humanize). In hmz, open `/flow`, go to
 **Flowverses → official → recursive_lean_prover** and **Install** it. It needs
-[`humanize1`](https://github.com/humanfia/humanize1-flow) `>=0.1.0,<0.2.0`, which hmz installs
+[`humanize1`](https://github.com/humanfia/humanize1-flow) `>=0.1.1,<0.2.0`, which hmz installs
 with it: the flow calls `humanize1:gen-plan` and `humanize1:rlcr` by name, and hmz looks for a
-name among the flows installed beside the one asking first.
+name among the flows installed beside the one asking first. humanize1 0.1.0 keeps its loops
+under `.humanize/`; from 0.1.1 they are under `.hmz/`, beside this flow's own state.
 
 To run a checkout of your own, keep `recursive_lean_prover` and `humanize1` side by side in one
 directory of flows and name the flow by its path:
 
 ```sh
-git clone --branch v0.1.1 https://github.com/humanfia/recursive-lean-prover-flow
+git clone --branch v0.1.2 https://github.com/humanfia/recursive-lean-prover-flow
 git clone --branch v0.1.1 https://github.com/humanfia/humanize1-flow
 mkdir -p flows
 cp -R recursive-lean-prover-flow/recursive_lean_prover humanize1-flow/humanize1 flows/
