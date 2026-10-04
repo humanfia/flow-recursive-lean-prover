@@ -1,13 +1,151 @@
 from __future__ import annotations
 
+import re
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 MIN_SUBPROBLEMS = 2
 
+ReferenceName = Literal["TauCeti", "lean-pool", "mathlib-internal"]
 
-class NaturalProof(BaseModel):
+
+class ReferenceUse(BaseModel):
+    """Auditable evidence that one mandatory local corpus was consulted."""
+
+    model_config = {"extra": "forbid"}
+
+    source: ReferenceName
+    queries: list[str] = Field(
+        min_length=1,
+        description="exact search terms or commands used in this source",
+    )
+    files: list[str] = Field(
+        min_length=1,
+        description="exact local files inspected, or the searched source root on no match",
+    )
+    conclusion: str = Field(
+        min_length=3,
+        description="relevant finding or an explicit no-relevant-match conclusion",
+    )
+
+
+class ReferenceAware(BaseModel):
+    """Structured stage output that proves all three corpora were considered."""
+
+    reference_use: list[ReferenceUse] = Field(
+        min_length=3,
+        max_length=3,
+        description="exactly one retrieval record for each mandatory source",
+    )
+
+    @field_validator("reference_use")
+    @classmethod
+    def _all_reference_sources(cls, value: list[ReferenceUse]) -> list[ReferenceUse]:
+        expected = {"TauCeti", "lean-pool", "mathlib-internal"}
+        found = {one.source for one in value}
+        if found != expected or len(value) != len(found):
+            raise ValueError(
+                "reference_use must contain exactly TauCeti, lean-pool, and mathlib-internal"
+            )
+        return value
+
+
+class FetchedProblem(BaseModel):
+    """Exactly one Lean-Eval leaderboard problem rendered as Markdown."""
+
+    model_config = {"extra": "forbid"}
+
+    problem_id: str = Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+        description="the one selected Lean-Eval problem id",
+    )
+    title: str = Field(min_length=1, max_length=300)
+    source_url: str = Field(
+        description="canonical https://lean-lang.org/eval/problems/<problem-id>/ URL"
+    )
+    data_url: str = Field(
+        description="canonical v2 JSON endpoint independently checked by the controller"
+    )
+    generated_at: str = Field(
+        min_length=1,
+        max_length=100,
+        description="site-data generation timestamp copied exactly from the v2 JSON",
+    )
+    statement_revision: int = Field(ge=1)
+    module: str = Field(min_length=1, max_length=500)
+    markdown: str = Field(
+        min_length=100,
+        max_length=8000000,
+        description="one self-contained Markdown page in the requested leaderboard format",
+    )
+
+    @model_validator(mode="after")
+    def _one_problem(self) -> FetchedProblem:
+        parsed = urlparse(self.source_url)
+        expected_path = f"/eval/problems/{self.problem_id}/"
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc != "lean-lang.org"
+            or parsed.path != expected_path
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "source_url must be the canonical leaf URL for exactly problem_id"
+            )
+        expected_data_url = (
+            f"https://lean-lang.org/eval/site-data/v2/problems/{self.problem_id}.json"
+        )
+        if self.data_url != expected_data_url:
+            raise ValueError(
+                "data_url must be the canonical v2 endpoint for problem_id"
+            )
+        headings = re.findall(r"(?m)^# (.+?)\s*$", self.markdown)
+        if len(headings) != 1:
+            raise ValueError(
+                "problem Markdown must contain exactly one top-level heading"
+            )
+        if headings[0].strip() != self.title.strip():
+            raise ValueError("problem Markdown heading must exactly match title")
+        problem_rows = re.findall(
+            r"(?m)^\| Problem id \| `([^`]+)` \|\s*$", self.markdown
+        )
+        if not problem_rows or any(row != self.problem_id for row in problem_rows):
+            raise ValueError(
+                "problem Markdown must contain Problem id rows that all match the "
+                "selected problem"
+            )
+        leaf_urls = set(
+            re.findall(
+                r"https://lean-lang\.org/eval/problems/[A-Za-z0-9][A-Za-z0-9_-]*/",
+                self.markdown,
+            )
+        )
+        if leaf_urls != {self.source_url}:
+            raise ValueError(
+                "problem Markdown must reference exactly the selected canonical problem URL"
+            )
+        required = (
+            f"]({self.source_url})",
+            f"> Leaderboard data generated: {self.generated_at}",
+            "## Leaderboard entry",
+            f"| Statement revision | `{self.statement_revision}` |",
+            f"| Module | `{self.module}` |",
+            "## Data limitations",
+        )
+        missing = [marker for marker in required if marker not in self.markdown]
+        if missing:
+            raise ValueError(
+                "problem Markdown is missing required single-problem markers: "
+                + ", ".join(missing)
+            )
+        return self
+
+
+class NaturalProof(ReferenceAware):
     """A natural-language proof produced before any Lean proof is attempted."""
 
     model_config = {"extra": "forbid"}
@@ -25,7 +163,7 @@ class NaturalProof(BaseModel):
     )
 
 
-class NaturalAudit(BaseModel):
+class NaturalAudit(ReferenceAware):
     """An independent reading of a natural-language proof."""
 
     model_config = {"extra": "forbid"}
@@ -39,6 +177,40 @@ class NaturalAudit(BaseModel):
     required_changes: list[str] = Field(
         description="repairs required before Lean formalization",
     )
+    requires_parent_revision: bool = Field(
+        default=False,
+        description=(
+            "true only when a non-root child's exact frozen proposition is "
+            "mathematically false or inconsistent, as established by a concrete "
+            "counterexample or contradiction; never for a hard proof, missing "
+            "library theorem, or incomplete argument"
+        ),
+    )
+    contract_contradiction: str = Field(
+        default="",
+        description=(
+            "complete counterexample or contradiction certifying why the exact "
+            "frozen child proposition cannot be proved; empty unless "
+            "requires_parent_revision is true"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _parent_revision_certificate(self) -> NaturalAudit:
+        if self.requires_parent_revision:
+            if self.acceptable:
+                raise ValueError(
+                    "a proof cannot be acceptable while requiring parent revision"
+                )
+            if not self.contract_contradiction.strip():
+                raise ValueError(
+                    "requires_parent_revision needs a concrete contract contradiction"
+                )
+        elif self.contract_contradiction.strip():
+            raise ValueError(
+                "contract_contradiction requires requires_parent_revision=true"
+            )
+        return self
 
     @property
     def passed(self) -> bool:
@@ -106,7 +278,7 @@ class SubproblemAudit(BaseModel):
     reason: str = Field(description="specific justification or first blocking defect")
 
 
-class DecompositionAudit(BaseModel):
+class DecompositionAudit(ReferenceAware):
     """Independent gate on the post-proof theorem decomposition."""
 
     model_config = {"extra": "forbid"}
@@ -134,7 +306,7 @@ def _no_subproblems() -> list[Subproblem]:
     return []
 
 
-class Decomposition(BaseModel):
+class Decomposition(ReferenceAware):
     """A proof split, or an explicit decision that the theorem is already atomic."""
 
     model_config = {"extra": "forbid"}
@@ -192,7 +364,7 @@ def _no_theorems() -> list[ProvedTheorem]:
     return []
 
 
-class LeanAudit(BaseModel):
+class LeanAudit(ReferenceAware):
     """Independent Lean review performed only after the machine comparator gate passes."""
 
     model_config = {"extra": "forbid"}

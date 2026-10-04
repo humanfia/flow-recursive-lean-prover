@@ -7,6 +7,17 @@ A native Humanize flow for recursively solving large mathematical problems in Le
 requires the repository comparator before and during every Lean review, displays a live DAG,
 and publishes every accepted theorem to a Markdown wiki.
 
+Before any planning or proof work, the flow downloads pinned snapshots of
+[TauCeti](https://github.com/TauCetiProject/TauCeti),
+[lean-pool](https://github.com/Vilin97/lean-pool), and the private
+[mathlib-internal dataset](https://huggingface.co/datasets/humanfia-lab/mathlib-internal). It then
+starts a dedicated fresh agent session that fetches exactly one pre-resolved problem from the
+[Lean-Eval problem catalog](https://lean-lang.org/eval/problems/) and freezes a `problem.md` page
+in the run artifacts. Planning, natural proof/review, decomposition, Lean RLCR, Lean review, and
+integration repair all receive that one-problem artifact and the same three local reference
+snapshots. Structured stages must return a three-source `reference_use` ledger, including an
+explicit no-match report when a corpus has no relevant result.
+
 This flow runs natively on the Humanize 2 `hmz` runtime and flow API. It calls `humanize1:gen-plan`
 and `humanize1:rlcr` as flows of its own flowverse -- the names under which the official flowverse
 exposes the ported Humanize 1 algorithms -- in the same process, handing them its own agents and
@@ -68,39 +79,62 @@ offline-reproducible and prevents Lake from trying to update shared read-only Gi
 
 ## Background
 
-1. **Restore or create the theorem node.** The controller loads the durable `dag.json`, preserves
+1. **Prepare the reference library.** Before creating a theorem node, the controller clones
+   TauCeti, lean-pool, and mathlib-internal into the ignored reference cache. It records the exact
+   commit and absolute path of every snapshot in the first `manifest.json`, makes the snapshots
+   read-only, and fails closed if any source is unavailable, incomplete, dirty, or no longer at its
+   pinned commit. An interprocess lock serializes cache creation across experiment supervisors.
+   A resumed run checks only each pinned snapshot's HEAD and read-only boundary rather than
+   rescanning it.
+2. **Fetch exactly one problem.** The controller resolves one problem id from `problem_id`, an
+   explicit problem URL, the workspace README, or the workspace directory. One fresh session of the
+   worker may fetch only that problem's canonical page and JSON. A schema rejects the catalog
+   URL, a mismatched id/URL, or Markdown containing more than one top-level problem. The validated
+   page is canonically rendered and atomically frozen as `problem.md`; resume reuses it instead of
+   fetching another entry. The controller retains the complete authoritative v2 JSON, checks the
+   agent's id, title, statement revision, module, and generation timestamp against it, and
+   deterministically derives every official Markdown section from that JSON. Task-digest run
+   selection and the sole acquisition-session checkpoint are locked and durable before network
+   work, so an interruption or concurrent supervisor cannot silently create another fetch session.
+3. **Restore or create the theorem node.** The controller loads the durable `dag.json`, preserves
    every accepted checkpoint, and creates the root only when no run exists.
-2. **Generate one scaffold.** The node invokes `humanize1:gen-plan` in direct mode exactly once.
+4. **Generate one scaffold.** The node invokes `humanize1:gen-plan` in direct mode exactly once.
    The resulting scaffold is frozen. There is no candidate-plan review loop and no later plan
    regeneration.
-3. **Prove the mathematics in natural language.** A Codex worker writes a complete proof and an
-   independent Codex reviewer checks the first invalid step. A rejection revises the latest proof,
-   not the scaffold. `natural_proof_attempts` is only the size of one checkpoint batch: reaching it
-   starts another batch from the latest draft and cannot kill the node.
-4. **Decide whether to split.** After the prose proof passes, a decomposition audit checks each
+5. **Prove the mathematics in natural language.** A Codex worker writes a complete proof and an
+   independent Codex reviewer checks the first invalid step against the exact DAG node, its title,
+   Lean declaration and frozen proposition. A rejection revises the latest proof, not the scaffold.
+   `natural_proof_attempts` is only the size of one checkpoint batch: reaching it starts another
+   batch from the latest draft and cannot kill the node. A reviewer turn that answers nothing is
+   retried on the same draft, up to `natural_proof_attempts` times with a growing pause, and then
+   once more asking for bare JSON, before the draft counts as rejected. Only when the reviewer
+   certifies, with a concrete counterexample or contradiction, that a non-root child's frozen
+   proposition is itself false does the child fail at once, so its parent revises its proof and
+   decomposition.
+6. **Decide whether to split.** After the prose proof passes, a decomposition audit checks each
    proposed child theorem, its exact Lean statement and name, and the acyclic dependency list. A
    child repeats the same lifecycle, so recursive workers also produce prose before Lean.
-5. **Launch the ready frontier.** Every node whose explicit prerequisites and required children
+7. **Launch the ready frontier.** Every node whose explicit prerequisites and required children
    have passed both isolated comparator gates is launched, up to `max_parallel_children`.
    Independent leaves from the same problem run together. A parent may therefore start while an
    accepted child is still `integrating`; the accepted child commits are overlaid into the
    parent's isolated worktree. In the diagram, `A --> B` always means that A depends on B.
-6. **Formalize in isolation.** Each ready Lean node gets a named Git branch and a short independent
+8. **Formalize in isolation.** Each ready Lean node gets a named Git branch and a short independent
    worktree. The official `humanize1:rlcr` worker/reviewer loop builds the Lean proof without sharing
    source files or build scratch state with sibling workers. Its implementation reviewer checks the
    worker against the selected node contract and author comparator, then returns control; it does not
    start a second repository-wide code-review phase.
-7. **Apply the acceptance gates.** The controller runs the project comparator, then a fresh Codex
+9. **Apply the acceptance gates.** The controller runs the project comparator, then a fresh Codex
    reviewer inspects the exact candidate and reruns that comparator itself. That creates an
    immutable accepted checkpoint and immediately unlocks dependants while canonical integration
    continues in the background. If concurrent proofs touched the same file, a separate integration
    worktree preserves both histories and the comparator checks the combined result.
-8. **Publish or revise.** Every accepted theorem is written to the wiki immediately and unlocks its
-   dependants. A mathematical, isolated Lean, comparator, or Lean-review rejection is fed back into
-   the latest natural-language proof at the appropriate upper level; it does not create another
-   plan. A failure caused only by combining already accepted histories stays in `integrating` and
-   enters a dedicated Codex repair plus machine/reviewer-comparator loop. It never invalidates or
-   restarts the accepted NL proof and never sends false theorem-failure feedback to the parent.
+10. **Publish or revise.** Every accepted theorem is written to the wiki immediately and unlocks its
+    dependants. A mathematical, isolated Lean, comparator, or Lean-review rejection is fed back into
+    the latest natural-language proof at the appropriate upper level; it does not create another
+    plan. A failure caused only by combining already accepted histories stays in `integrating` and
+    enters a dedicated Codex repair plus machine/reviewer-comparator loop. It never invalidates or
+    restarts the accepted NL proof and never sends false theorem-failure feedback to the parent.
 
 ## Install
 
@@ -129,9 +163,17 @@ Copy rather than link the flow: hmz reads the flows beside it from where its fil
 
 - Humanize with the new flow API (`hmz exec -a/-e/-p/-b`).
 - [`humanize1`](https://github.com/humanfia/flow-humanize1) installed beside it, whose
-  `gen-plan` and `rlcr` it calls by those names (see [Install](#install)).
+  `gen-plan` and `rlcr` it calls by those names (see [Install](#install)). Its `rlcr` must expose
+  the `skip_code_review` param: the flow refuses an older one, stopping the run, rather than
+  silently running the duplicate repository-wide review.
 - Lean projects should pin `leanprover/lean4:v4.33.0` in `lean-toolchain` when reproducing the
   current Lean-Eval experiment.
+- Network access for the one-problem agent and the initial reference downloads.
+- A Hugging Face read token with access to the private `humanfia-lab/mathlib-internal` dataset,
+  supplied through `HF_TOKEN` (or the variable `huggingface_token_env` names). The token is used
+  only through a Git askpass environment and is not written to params, prompts, manifests, logs,
+  or Git remote URLs. Once the snapshots are ready it is dropped from the run's environment, and
+  every comparator runs with it unset.
 - Run at the root of a clean Lean git repository that ignores `.humanize/`.
 - Provide a comparator wrapper such as `tools/check-with-comparator.sh`.
 - The comparator must exit zero and print the configured success marker.
@@ -140,16 +182,30 @@ Copy rather than link the flow: hmz reads the flows beside it from where its fil
   of the hidden `turn` subflow, so its session, and the CLI serving it, closes as it ends.
 
 The comparator is called once by the flow before review, then the reviewer is required to run
-it again. It receives `HUMANIZE_NODE_ID`, `HUMANIZE_NODE_STATEMENT`,
-`HUMANIZE_LEAN_FILES`, `HUMANIZE_RUN_DIR`, and `HUMANIZE_WIKI_DIR`. A repository that needs a
-different comparator target for each generated lemma should use these values in its wrapper.
+it again. It receives `HUMANIZE_NODE_ID`, `HUMANIZE_NODE_STATEMENT`, `HUMANIZE_LEAN_FILES`,
+`HUMANIZE_CANDIDATE_BASE_COMMIT`, `HUMANIZE_RUN_DIR`, `HUMANIZE_WIKI_DIR`,
+`HUMANIZE_PROBLEM_MARKDOWN`, and `HUMANIZE_REFERENCE_MANIFEST`. `HUMANIZE_CANDIDATE_BASE_COMMIT`
+is the node's immutable proof-base commit, so project wrappers can attribute diagnostics across
+the complete candidate history, including accepted-child overlays and every RLCR round, rather
+than only the final commit. A repository that needs a different comparator target for each
+generated lemma should use these values in its wrapper.
 
 ### Run
 
-First create a task file such as `PROBLEM.md`. It should state the exact theorem(s), the Lean file
-that may be edited, any files that must not be inspected or changed, and any project-specific
-acceptance rules. Both roles may read the internet in this flow's own turns, but a task may impose
-a narrower source policy.
+First create a task file such as `PROBLEM.md`. It supplies experiment instructions and the local
+Lean contract; it is no longer expected to be a hand-copied leaderboard page. Set the `problem_id`
+param for the strongest selection guarantee. When it is blank, the flow deterministically derives
+one id from an explicit `https://lean-lang.org/eval/problems/<id>/` URL in the task, the workspace
+README's `Problem ID`, or the workspace directory name. The fetch agent never chooses an arbitrary
+item from the catalog. Both roles may read the internet in this flow's own turns, but a task may
+impose a narrower source policy.
+
+Export the Hugging Face token in the shell that launches `hmz`. Do not put its value in the task or
+in a param:
+
+```sh
+export HF_TOKEN='<your read token>'
+```
 
 Provide a project-specific comparator wrapper. It must return a nonzero status on rejection and
 print the configured marker only after every required check succeeds. Adapt this outline to the
@@ -163,8 +219,7 @@ lake env lean Submission.lean
 printf '%s\n' 'Your solution is okay!'
 ```
 
-The wrapper can use `HUMANIZE_NODE_ID`, `HUMANIZE_NODE_STATEMENT`,
-`HUMANIZE_LEAN_FILES`, `HUMANIZE_RUN_DIR`, and `HUMANIZE_WIKI_DIR`. Never print the success marker
+The wrapper can use any of the `HUMANIZE_*` variables above. Never print the success marker
 before the real evaluator succeeds.
 
 Then run both roles on Codex, with the params the problem needs and a budget, which `hmz exec`
@@ -197,12 +252,24 @@ takes no `-e`. Every param has a default and is set with `-p <name>=<value>`:
 | `plan_turn_timeout` | `3600` | Seconds for one planning turn; 0 disables it. |
 | `plan_total_timeout` | `14400` | Seconds for one whole planning phase; 0 disables it. |
 | `comparator_timeout` | `21600` | Seconds for each comparator execution: six hours. |
+| `problem_id` | blank | The sole Lean-Eval problem the acquisition session may fetch; blank infers it as above. |
+| `problem_fetch_attempts` | `3` | Schema-correction attempts within that one fresh fetch session, 1 to 8. |
 | `lean_target` | blank | Project-relative candidate `.lean` file; blank lets the worker infer it. |
+| `agent_hidden_files` | `[]` | Tracked comparator-only files, as a JSON list, removed from every agent checkout (below). |
 | `comparator_command` | `bash tools/check-with-comparator.sh` | The comparator, split like argv and run with no shell. |
 | `comparator_success` | `Your solution is okay!` | Text successful comparator output must contain. |
 | `artifact_dir` | `.humanize/recursive-lean-prover` | Plans, proofs, DAGs, logs and run state; under `.humanize/`. |
 | `wiki_dir` | `.humanize/math-wiki` | The theorem wiki; under `.humanize/`. |
+| `reference_dir` | `.humanize/math-reference-library` | Cache of the three pinned reference checkouts; under `.humanize/`. |
+| `huggingface_token_env` | `HF_TOKEN` | Name of the environment variable carrying the private dataset token. |
 | `stop_on_child_failure` | `true` | Block a parent when a required subproblem fails. |
+
+`agent_hidden_files` names tracked files only the comparator may read, such as
+`-p 'agent_hidden_files=["Solution.lean"]'`. Before any agent starts, the flow marks each
+`skip-worktree` and deletes it from the main checkout and from every node and integration
+worktree, without dirtying Git and without touching other uncommitted work there. The comparator
+may stage their committed blobs itself; prompts forbid recovering them through Git history or other
+worktrees. A run refuses a listed file that is untracked or differs from `HEAD`.
 
 `comparator_command` may use the placeholders `{node_id}`, `{node_dir}`, `{run_dir}`,
 `{wiki_dir}`, `{lean_target}` and `{lean_files}`.
@@ -243,6 +310,14 @@ at `.humanize/math-wiki/README.md`. A theorem is published as soon as that node 
 controller comparator and the fresh reviewer's independent rerun; publication does not wait for
 the root theorem or the rest of the problem. Pages include the natural proof, frozen scaffold,
 Lean source, recursion level, and comparator evidence.
+
+The run directory also contains exactly one fetched `problem.md`, its structured `problem.json`,
+the controller's `problem-site-data.json`, and `preflight.json`. The reference cache's
+`manifest.json` records all three repository commits. `DAG.md` repeats the problem and
+reference-manifest paths for every live status view. Downloads are reused on resume; they are not
+silently refreshed midway through an experiment. A run of the same task (and `problem_id`) finds
+its run directory again from `runs-by-task/<digest>.run` and the run's own `run.json`, even when
+`LATEST` points at another task's run.
 
 The Mermaid diagram uses one line style and one direction convention everywhere: every solid arrow
 `A --> B` means **A depends on B**, so B must be proved before A can finish. A parent theorem points

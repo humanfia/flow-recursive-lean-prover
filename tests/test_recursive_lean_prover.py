@@ -20,6 +20,7 @@ import subprocess
 import sys
 import textwrap
 import uuid
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any
@@ -37,6 +38,7 @@ from hmz.flows import (
     ParamsError,
     Permission,
     PermissionRequestHookAgentMixin,
+    RequirementError,
     ScratchDirEnvMixin,
     WorktreeError,
 )
@@ -310,10 +312,10 @@ def repository(
     return project
 
 
-@pytest.fixture(scope="module")
-def loaded(tmp_path_factory: pytest.TempPathFactory) -> Any:
+@contextlib.contextmanager
+def flowverse(root: Path) -> Iterator[SimpleNamespace]:
     """The flow and its stand-in `humanize1`, loaded from a flowverse of their own."""
-    flows = tmp_path_factory.mktemp("verse") / "flows"
+    flows = root / "flows"
     shutil.copytree(
         FLOW,
         flows / "recursive_lean_prover",
@@ -323,21 +325,133 @@ def loaded(tmp_path_factory: pytest.TempPathFactory) -> Any:
     (flows / "humanize1" / "__init__.py").write_text(textwrap.dedent(HUMANIZE1))
     entry = load_flow(str(flows / "recursive_lean_prover"), caller_globals={})
     rlcr = load_flow(f"{flows / 'humanize1'}:rlcr", caller_globals={})
-    yield SimpleNamespace(
-        flows=flows,
-        entry=entry,
-        nested=load_flow(
-            f"{flows / 'recursive_lean_prover'}:worktree-rlcr", caller_globals={}
-        ),
-        turn=load_flow(f"{flows / 'recursive_lean_prover'}:turn", caller_globals={}),
-        flow=sys.modules[entry.fn.__module__],
-        runtime=sys.modules["_recursive_lean.runtime"],
-        models=sys.modules["_recursive_lean.models"],
-        store=sys.modules["_recursive_lean.store"],
-        prompts=sys.modules["_recursive_lean.prompts"],
-        calls=rlcr.globals["CALLS"],
+    try:
+        yield SimpleNamespace(
+            flows=flows,
+            entry=entry,
+            nested=load_flow(
+                f"{flows / 'recursive_lean_prover'}:worktree-rlcr", caller_globals={}
+            ),
+            turn=load_flow(
+                f"{flows / 'recursive_lean_prover'}:turn", caller_globals={}
+            ),
+            flow=sys.modules[entry.fn.__module__],
+            runtime=sys.modules["_recursive_lean.runtime"],
+            models=sys.modules["_recursive_lean.models"],
+            store=sys.modules["_recursive_lean.store"],
+            prompts=sys.modules["_recursive_lean.prompts"],
+            preflight=sys.modules["_recursive_lean.preflight"],
+            calls=rlcr.globals["CALLS"],
+        )
+    finally:
+        loading.forget(flows)
+
+
+@pytest.fixture(scope="module")
+def loaded(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SimpleNamespace]:
+    with flowverse(tmp_path_factory.mktemp("verse")) as made:
+        yield made
+
+
+#: A complete reference ledger, citing each snapshot's README by a path relative to it.
+REFERENCE_USE = [
+    {
+        "source": source,
+        "queries": ["fixture query"],
+        "files": ["README.md"],
+        "conclusion": "fixture source was consulted",
+    }
+    for source in ("TauCeti", "lean-pool", "mathlib-internal")
+]
+
+
+def problem_site_data(problem_id: str) -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "generated_at": "2026-09-08T10:02:54Z",
+        "problem": {
+            "id": problem_id,
+            "title": "Mihăilescu's theorem",
+            "statement_revision": 1,
+            "module": "LeanEval.NumberTheory.Mihailescu",
+            "stable_url": f"problems/{problem_id}/",
+        },
+    }
+
+
+def problem_markdown(problem_id: str) -> str:
+    return f"""# Mihăilescu's theorem
+
+> Source: [Lean AI formalization leaderboard](https://lean-lang.org/eval/problems/{problem_id}/)
+> Crawled: 2026-09-08
+> Leaderboard data generated: 2026-09-08T10:02:54Z
+
+## Leaderboard entry
+
+| Field | Value |
+| --- | --- |
+| Problem id | `{problem_id}` |
+| Group | `formalization-evaluation` |
+| Statement revision | `1` |
+| Module | `LeanEval.NumberTheory.Mihailescu` |
+
+## Problem
+
+The one selected mathematical problem.
+
+## Data limitations
+
+- None relevant to this fixture.
+"""
+
+
+def fetched_problem(loaded: Any, problem_id: str) -> Any:
+    return loaded.models.FetchedProblem(
+        problem_id=problem_id,
+        title="Mihăilescu's theorem",
+        source_url=f"https://lean-lang.org/eval/problems/{problem_id}/",
+        data_url=f"https://lean-lang.org/eval/site-data/v2/problems/{problem_id}.json",
+        generated_at="2026-09-08T10:02:54Z",
+        statement_revision=1,
+        module="LeanEval.NumberTheory.Mihailescu",
+        markdown=problem_markdown(problem_id),
     )
-    loading.forget(flows)
+
+
+def reference_bundle(loaded: Any, root: Path) -> Any:
+    """Three reference snapshots, each holding the README `REFERENCE_USE` cites."""
+    paths: dict[str, Path] = {}
+    for source in loaded.preflight.REFERENCE_SOURCES:
+        path = root / source.directory
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "README.md").write_text("fixture\n")
+        paths[source.name] = path.resolve()
+    return loaded.preflight.ReferenceBundle(
+        root=root.resolve(),
+        manifest=root.resolve() / "manifest.json",
+        paths=paths,
+        commits={source: "a" * 40 for source in paths},
+    )
+
+
+@pytest.fixture
+def offline(loaded: Any, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Preflight with what it would download already here: the snapshots, and the JSON.
+
+    Every reference library prepared is made where it was asked for, and listed.
+    """
+    prepared: list[Any] = []
+
+    def prepare(library: Any) -> Any:
+        prepared.append(reference_bundle(loaded, library.root))
+        return prepared[-1]
+
+    async def site_data(runtime: Any) -> dict[str, Any]:
+        return problem_site_data(runtime.problem_id)
+
+    monkeypatch.setattr(loaded.preflight.ReferenceLibrary, "prepare", prepare)
+    monkeypatch.setattr(loaded.runtime.Runtime, "_problem_site_data", site_data)
+    return prepared
 
 
 def runtime_for(
@@ -369,6 +483,49 @@ def test_nested_rlcr_does_not_enable_generic_code_review(loaded: Any) -> None:
     assert forwarded["base_branch"] == ""
     assert forwarded["skip_code_review"] is True
     assert forwarded["skip_impl"] is False
+
+
+def test_nested_rlcr_refuses_an_rlcr_that_cannot_skip_review(
+    loaded: Any, tmp_path: Path
+) -> None:
+    class Older(pydantic.BaseModel):
+        plan_file: str = ""
+        max: int = 42
+        base_branch: str = ""
+
+    class OlderRlcr:
+        expected_params = Older
+
+        def __init__(self) -> None:
+            self.called = False
+
+        async def __call__(self, *_: Any, **__: Any) -> str:
+            self.called = True
+            return "complete"
+
+    with pytest.raises(RequirementError, match="too old"):
+        loaded.flow._require_explicit_rlcr_review_skip(OlderRlcr())
+
+    # Inside the bridge, before RLCR is handed anything: the run stops, failing closed.
+    worktree = repository(tmp_path / "node")
+    older = OlderRlcr()
+    with (
+        patch.object(loaded.flow, "load", return_value=older),
+        pytest.raises(RequirementError, match="too old"),
+    ):
+        asyncio.run(
+            run_fake(
+                loaded.nested,
+                "prove the node",
+                agents={
+                    "worker": FakeAgentDriver(HarnessKind.CODEX),
+                    "reviewer": FakeAgentDriver(HarnessKind.CODEX),
+                },
+                params={"plan_file": "/tmp/immutable-plan.md"},
+                local=DirEnv(worktree, tmp_path / "scratch"),
+            )
+        )
+    assert not older.called
 
 
 def test_public_recursive_lean_flow_contract(loaded: Any) -> None:
@@ -424,6 +581,29 @@ def test_params_are_read_as_command_line_values(loaded: Any) -> None:
         loaded.entry.params_of({"artifact_dir": "/tmp/elsewhere"})
     with pytest.raises(ParamsError, match=r"must name a \.lean file"):
         loaded.entry.params_of({"lean_target": "Submission.txt"})
+    with pytest.raises(ParamsError, match="one Lean-Eval problem id"):
+        loaded.entry.params_of({"problem_id": "../mihailescu"})
+    with pytest.raises(ParamsError, match="common system environment variable"):
+        loaded.entry.params_of({"huggingface_token_env": "PATH"})
+    with pytest.raises(ParamsError, match=r"below \.humanize/"):
+        loaded.entry.params_of({"reference_dir": "references"})
+    config = loaded.entry.params_of(
+        {"problem_id": "mihailescu", "agent_hidden_files": '["Solution.lean"]'}
+    )
+    assert config.problem_id == "mihailescu"
+    assert config.agent_hidden_files == ("Solution.lean",)
+
+
+def test_agent_hidden_files_require_safe_unique_relative_paths(loaded: Any) -> None:
+    config = loaded.flow.Config
+    assert config(agent_hidden_files=["Solution.lean"]).agent_hidden_files == (
+        "Solution.lean",
+    )
+    for invalid in (["../Solution.lean"], ["/tmp/Solution.lean"], [".git/config"]):
+        with pytest.raises(pydantic.ValidationError):
+            config(agent_hidden_files=invalid)
+    with pytest.raises(pydantic.ValidationError, match="unique"):
+        config(agent_hidden_files=["Solution.lean", "Solution.lean"])
 
 
 # ------------------------------------------------------------------------------ the store
@@ -748,6 +928,147 @@ def test_comparator_runs_in_its_env_with_node_variables_and_a_timeout(
         asyncio.run(DirEnv(project, tmp_path).exec(["sleep", "30"], timeout=0.2))
 
 
+def test_comparator_commands_receive_stable_candidate_base_and_no_token(
+    loaded: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = repository(tmp_path / "comparator_base_problem")
+    (project / "tools").mkdir()
+    (project / "tools" / "check.sh").write_text(
+        'printf "base=%s token=%s problem=%s\\n" "$HUMANIZE_CANDIDATE_BASE_COMMIT" '
+        '"${HF_TOKEN-unset}" "$HUMANIZE_PROBLEM_MARKDOWN"\n'
+        'printf "%s\\n" "Your solution is okay!"\n'
+    )
+    monkeypatch.setenv("HF_TOKEN", "bootstrap-only-secret")
+    runtime = runtime_for(
+        loaded,
+        project,
+        tmp_path,
+        "comparator base fixture",
+        lean_target="Submission.lean",
+        comparator_command="bash tools/check.sh {node_id}",
+    )
+    node = loaded.models.NodeRecord(
+        id="root.stable-base-a1",
+        title="Stable base",
+        statement="True",
+        proof_base_commit="abc123",
+    )
+
+    rendered = runtime._review_command(node, ["Submission.lean"])
+
+    assert rendered.startswith("env -u HF_TOKEN ")
+    assert "HUMANIZE_CANDIDATE_BASE_COMMIT=abc123" in rendered
+    assert f"HUMANIZE_PROBLEM_MARKDOWN={runtime.problem_path}" in rendered
+    assert "tools/check.sh root.stable-base-a1" in rendered
+    reviewed = subprocess.run(
+        rendered, shell=True, cwd=project, capture_output=True, text=True, check=True
+    )
+    assert "base=abc123 token=unset" in reviewed.stdout
+    passed, _, log = asyncio.run(runtime._compare(node, ["Submission.lean"]))
+    assert passed, log
+    assert f"base=abc123 token=unset problem={runtime.problem_path}" in log
+    assert "bootstrap-only-secret" not in log
+
+
+def test_agent_hidden_file_is_absent_from_primary_and_node_worktrees(
+    loaded: Any, tmp_path: Path
+) -> None:
+    project = repository(tmp_path / "protected_problem")
+    (project / "Solution.lean").write_text("theorem protected : True := by trivial\n")
+    git(project, "add", "Solution.lean")
+    git(project, "commit", "-m", "test: add the comparator-only solution")
+    runtime = runtime_for(
+        loaded,
+        project,
+        tmp_path,
+        "fixture theorem",
+        agent_hidden_files=["Solution.lean"],
+    )
+    node = loaded.models.NodeRecord(
+        id="root.leaf-a1", title="Leaf", statement="True", attempts=1
+    )
+
+    async def scenario() -> Path:
+        await runtime._seal_agent_workspace(runtime.workspace)
+        assert await runtime._git_clean(runtime.workspace)
+        worktree = await runtime._node_worktree(node)
+        assert await runtime._git_clean(worktree)
+        return Path(str(worktree.workdir))
+
+    path = asyncio.run(scenario())
+
+    for checkout in (project, path):
+        assert not (checkout / "Solution.lean").exists()
+        assert git(checkout, "ls-files", "-v", "Solution.lean").startswith("S ")
+    context = runtime._problem_context()
+    assert "`Solution.lean` are deliberately absent" in context
+    assert "Do not recover or inspect them through Git objects/history" in context
+
+
+def test_resealing_preserves_preexisting_participant_changes(
+    loaded: Any, tmp_path: Path
+) -> None:
+    project = repository(tmp_path / "dirty_participant_worktree")
+    (project / "Solution.lean").write_text("theorem protected : True := by trivial\n")
+    git(project, "add", "Solution.lean")
+    git(project, "commit", "-m", "test: add the comparator-only solution")
+    runtime = runtime_for(
+        loaded,
+        project,
+        tmp_path,
+        "fixture theorem",
+        agent_hidden_files=["Solution.lean"],
+    )
+    (project / "Submission.lean").write_text(
+        "namespace Submission\ntheorem work : True := by trivial\nend Submission\n"
+    )
+    (project / "Submission").mkdir()
+    (project / "Submission" / "Work.lean").write_text(
+        "namespace Submission\ntheorem moreWork : True := by trivial\nend Submission\n"
+    )
+
+    async def scenario() -> tuple[str, str]:
+        before = await runtime._git_status_snapshot(runtime.workspace)
+        await runtime._seal_agent_workspace(runtime.workspace)
+        await runtime._seal_agent_workspace(runtime.workspace)
+        return before, await runtime._git_status_snapshot(runtime.workspace)
+
+    before, after = asyncio.run(scenario())
+
+    assert after == before
+    assert not (project / "Solution.lean").exists()
+    assert git(project, "ls-files", "-v", "Solution.lean").startswith("S ")
+
+
+def test_long_node_identities_do_not_collide(loaded: Any, tmp_path: Path) -> None:
+    project = tmp_path / "identity_problem"
+    project.mkdir()
+    runtime = runtime_for(loaded, project, tmp_path, "identity fixture")
+    prefix = "root." + "shared_collision_segment_" * 5
+    left, right, legacy_node = (
+        loaded.models.NodeRecord(
+            id=prefix + suffix, title=suffix, statement="True", attempts=1
+        )
+        for suffix in ("nontrivial-a1", "torsion-a1", "legacy-a1")
+    )
+    slug = loaded.store.slug
+
+    assert slug(left.id) == slug(right.id)
+    assert runtime._node_branch(left) != runtime._node_branch(right)
+    assert runtime._node_dir(left) != runtime._node_dir(right)
+    assert len(runtime._node_dir(left).name) <= 80
+    assert len(runtime._node_dir(right).name) <= 80
+    worktrees = tmp_path / "worktrees"
+    assert runtime._node_worktree_path(left, worktrees) != (
+        runtime._node_worktree_path(right, worktrees)
+    )
+
+    # A run made before identities were told apart keeps the directory it wrote.
+    legacy = runtime.run_root / "nodes" / slug(legacy_node.id)
+    legacy.mkdir(parents=True)
+    assert runtime._node_dir(legacy_node) == legacy
+
+
 # ---------------------------------------------------------------------------- integration
 
 
@@ -1001,6 +1322,43 @@ def test_parallel_same_file_leaf_additions_are_union_integrated(
     assert git(project, "status", "--porcelain") == ""
 
 
+def test_empty_cherry_pick_after_lean_union_is_accepted(
+    loaded: Any, tmp_path: Path
+) -> None:
+    project = repository(
+        tmp_path / "empty_union_problem", submission="theorem value : Nat := 0\n"
+    )
+    runtime = runtime_for(loaded, project, tmp_path, "empty-union fixture")
+    [node] = _leaves(loaded, ("union_duplicate",))
+
+    async def keep_canonical(integration: Any) -> tuple[bool, str]:
+        await integration.exec(["git", "checkout", "--ours", "Submission.lean"])
+        await integration.exec(["git", "add", "Submission.lean"])
+        return True, "kept already-integrated canonical Lean source"
+
+    async def scenario() -> tuple[bool, bool, str]:
+        worktree = await runtime._node_worktree(node)
+        path = Path(str(worktree.workdir))
+        (path / "Submission.lean").write_text("theorem value : Nat := 1\n")
+        git(path, "add", "Submission.lean")
+        git(path, "commit", "-m", "feat: candidate value")
+        candidate = await runtime._git_head(worktree)
+        (project / "Submission.lean").write_text("theorem value : Nat := 2\n")
+        git(project, "add", "Submission.lean")
+        git(project, "commit", "-m", "feat: canonical value")
+        with patch.object(runtime, "_union_lean_conflicts", keep_canonical):
+            return await runtime._apply_candidate_commits(
+                runtime.workspace, [candidate]
+            )
+
+    applied, unioned, feedback = asyncio.run(scenario())
+
+    assert applied, feedback
+    assert unioned
+    assert (project / "Submission.lean").read_text() == "theorem value : Nat := 2\n"
+    assert git(project, "status", "--porcelain") == ""
+
+
 def test_parent_worktree_overlays_accepted_child_candidate(
     loaded: Any, tmp_path: Path
 ) -> None:
@@ -1050,6 +1408,264 @@ def test_parent_worktree_overlays_accepted_child_candidate(
     )
 
 
+# ----------------------------------------------------------------- the natural-language gate
+
+
+def _scripted(runtime: Any, **replies: list[Any]) -> list[tuple[str, str]]:
+    """Answers each role's turns, in order, from `replies`; and every turn asked of it."""
+    runtime.worker = SimpleNamespace(role="worker")
+    runtime.reviewer = SimpleNamespace(role="reviewer")
+    queued = {role: iter(answers) for role, answers in replies.items()}
+    asked: list[tuple[str, str]] = []
+
+    async def ask(agent: Any, prompt: str, schema: Any = None, env: Any = None) -> Any:
+        asked.append((agent.role, prompt))
+        return next(queued[agent.role])
+
+    runtime._ask = ask
+    return asked
+
+
+def _natural_proof(loaded: Any) -> Any:
+    return loaded.models.NaturalProof(
+        reference_use=REFERENCE_USE,
+        proof=(
+            "1. Establish the required intermediate lemma.\n"
+            "2. Apply it to prove the exact frozen theorem."
+        ),
+        key_steps=["Establish and apply the intermediate lemma."],
+        unresolved=[],
+    )
+
+
+def _natural_runtime(
+    loaded: Any, tmp_path: Path, name: str, **params: Any
+) -> tuple[Any, Path]:
+    project = tmp_path / name
+    project.mkdir()
+    runtime = runtime_for(loaded, project, tmp_path, **params)
+    runtime.reference_bundle = reference_bundle(loaded, tmp_path / "references")
+    plan = project / "plan.md"
+    plan.write_text("# Accepted plan\n")
+    return runtime, plan
+
+
+def test_child_contract_contradiction_returns_to_parent(
+    loaded: Any, tmp_path: Path
+) -> None:
+    runtime, plan = _natural_runtime(
+        loaded, tmp_path, "contradicted_child_problem", natural_proof_attempts=1
+    )
+    audit = loaded.models.NaturalAudit(
+        reference_use=REFERENCE_USE,
+        acceptable=False,
+        first_invalid_step="Before Step 1: the exact frozen child proposition is false.",
+        required_changes=["Revise the parent decomposition."],
+        requires_parent_revision=True,
+        contract_contradiction=(
+            "For the explicit fixture x, the frozen conclusion says x = 0, "
+            "while direct evaluation gives x = 1."
+        ),
+    )
+    asked = _scripted(runtime, worker=[_natural_proof(loaded)], reviewer=[audit])
+    node = runtime.store.ensure(
+        "root.false_child-a1",
+        parent="root",
+        depth=1,
+        title="False child",
+        statement="Every fixture is zero",
+        lean_name="false_child",
+        lean_statement="∀ x : Nat, x = 0",
+    )
+
+    accepted = asyncio.run(runtime._accepted_natural_proof(node, plan))
+
+    assert accepted is None
+    assert node.status == "failed"
+    assert "frozen child contract" in node.message
+    assert "direct evaluation gives x = 1" in node.message
+    assert [role for role, _ in asked] == ["worker", "reviewer"]
+    review = asked[1][1]
+    assert "- DAG node: `root.false_child-a1`" in review
+    assert "- Lean declaration: `Submission.false_child`" in review
+    assert "- Frozen Lean proposition: `∀ x : Nat, x = 0`" in review
+
+
+def test_failed_child_natural_gate_unwinds_solve(loaded: Any, tmp_path: Path) -> None:
+    runtime, plan = _natural_runtime(loaded, tmp_path, "parent_backtrack_problem")
+    node = runtime.store.ensure(
+        "root.false_child-a1",
+        parent="root",
+        depth=1,
+        title="False child",
+        statement="False child statement",
+    )
+    node.plan = plan.name
+
+    async def reject_contract(*_: Any) -> None:
+        runtime.store.update(
+            node.id, "failed", "reviewer-certified child contradiction"
+        )
+
+    with (
+        patch.object(runtime, "_accepted_natural_proof", side_effect=reject_contract),
+        patch.object(runtime, "_revise_parent") as revise_parent,
+    ):
+        result = asyncio.run(runtime._solve(node))
+
+    assert not result.ok
+    assert result.node_id == node.id
+    assert "child contradiction" in result.feedback
+    revise_parent.assert_called_once_with(node, node.message)
+
+
+def test_parent_revision_certificate_requires_concrete_contradiction(
+    loaded: Any,
+) -> None:
+    fixture: dict[str, Any] = {
+        "reference_use": REFERENCE_USE,
+        "acceptable": False,
+        "first_invalid_step": "The child target is false.",
+        "required_changes": ["Revise the parent decomposition."],
+        "requires_parent_revision": True,
+    }
+    audit = loaded.models.NaturalAudit
+    with pytest.raises(pydantic.ValidationError, match="concrete contract"):
+        audit(**fixture)
+    with pytest.raises(pydantic.ValidationError, match="cannot be acceptable"):
+        audit(
+            **fixture
+            | {"acceptable": True, "contract_contradiction": "A contradiction."}
+        )
+    with pytest.raises(pydantic.ValidationError, match="requires_parent_revision"):
+        audit(
+            **fixture
+            | {
+                "requires_parent_revision": False,
+                "contract_contradiction": "A contradiction.",
+            }
+        )
+
+
+def test_null_natural_audit_retries_same_draft_before_reauthoring(
+    loaded: Any, tmp_path: Path
+) -> None:
+    runtime, plan = _natural_runtime(
+        loaded, tmp_path, "natural_review_retry_problem", natural_proof_attempts=2
+    )
+    proof = _natural_proof(loaded)
+    audit = loaded.models.NaturalAudit(
+        reference_use=REFERENCE_USE,
+        acceptable=True,
+        first_invalid_step="",
+        required_changes=[],
+    )
+    asked = _scripted(runtime, worker=[proof], reviewer=[None, audit])
+    node = runtime.store.ensure(
+        "root",
+        parent=None,
+        depth=0,
+        title="Retry reviewer",
+        statement="True",
+        lean_name="retry_reviewer",
+        lean_statement="True",
+    )
+    pause = AsyncMock()
+
+    with patch.object(loaded.runtime.asyncio, "sleep", pause):
+        accepted = asyncio.run(runtime._accepted_natural_proof(node, plan))
+
+    assert accepted is proof
+    reviews = [prompt for role, prompt in asked if role == "reviewer"]
+    assert [role for role, _ in asked] == ["worker", "reviewer", "reviewer"]
+    assert "previous reviewer call" not in reviews[0]
+    assert "previous reviewer call" in reviews[1]
+    pause.assert_awaited_once_with(15.0)
+    assert node.status == "decomposing"
+    node_dir = runtime._node_dir(node)
+    assert (node_dir / "natural-review-null-v1-attempt-1.txt").is_file()
+    assert (node_dir / "natural-audit-v1.json").is_file()
+    accepted_proof = (runtime.project / node.natural_proof).read_text()
+    assert "## Reference use\n\n### TauCeti" in accepted_proof
+
+
+def test_null_natural_audit_uses_json_transport_fallback(
+    loaded: Any, tmp_path: Path
+) -> None:
+    runtime, plan = _natural_runtime(
+        loaded,
+        tmp_path,
+        "natural_review_json_fallback_problem",
+        natural_proof_attempts=2,
+    )
+    proof = _natural_proof(loaded)
+    audit = loaded.models.NaturalAudit(
+        reference_use=REFERENCE_USE,
+        acceptable=True,
+        first_invalid_step="",
+        required_changes=[],
+    )
+    asked = _scripted(
+        runtime,
+        worker=[proof],
+        reviewer=[None, None, f"```json\n{audit.model_dump_json()}\n```"],
+    )
+    node = runtime.store.ensure(
+        "root",
+        parent=None,
+        depth=0,
+        title="Recover reviewer JSON",
+        statement="True",
+        lean_name="recover_reviewer_json",
+        lean_statement="True",
+    )
+    pause = AsyncMock()
+
+    with patch.object(loaded.runtime.asyncio, "sleep", pause):
+        accepted = asyncio.run(runtime._accepted_natural_proof(node, plan))
+
+    assert accepted is proof
+    assert [role for role, _ in asked] == ["worker", *["reviewer"] * 3]
+    assert "JSON Schema" in asked[-1][1]
+    pause.assert_awaited_once_with(15.0)
+    assert node.status == "decomposing"
+    node_dir = runtime._node_dir(node)
+    assert (node_dir / "natural-audit-v1.json").is_file()
+    marker = node_dir / "natural-review-json-fallback-v1.txt"
+    assert "produced a valid" in marker.read_text()
+
+
+def test_reference_evidence_outside_the_snapshots_is_fed_back(
+    loaded: Any, tmp_path: Path
+) -> None:
+    runtime, plan = _natural_runtime(
+        loaded, tmp_path, "reference_problem", natural_proof_attempts=1
+    )
+    stray = _natural_proof(loaded).model_dump()
+    stray["reference_use"][0]["files"] = [str(tmp_path / "elsewhere.md")]
+    (tmp_path / "elsewhere.md").write_text("not a snapshot\n")
+    audit = loaded.models.NaturalAudit(
+        reference_use=REFERENCE_USE,
+        acceptable=True,
+        first_invalid_step="",
+        required_changes=[],
+    )
+    asked = _scripted(
+        runtime,
+        worker=[loaded.models.NaturalProof(**stray), _natural_proof(loaded)],
+        reviewer=[audit],
+    )
+    node = runtime.store.ensure(
+        "root", parent=None, depth=0, title="Root", statement="True"
+    )
+
+    accepted = asyncio.run(runtime._accepted_natural_proof(node, plan))
+
+    assert accepted is not None
+    assert [role for role, _ in asked] == ["worker", "worker", "reviewer"]
+    assert "did not cite an existing path" in asked[1][1]
+
+
 # ------------------------------------------------------------------------------ the frontier
 
 
@@ -1081,6 +1697,7 @@ def test_child_frontier_refills_without_waiting_for_slow_sibling(
         "root", parent=None, depth=0, title="Root", statement="True"
     )
     decomposition = loaded.models.Decomposition(
+        reference_use=REFERENCE_USE,
         should_split=True,
         rationale="three-node dependency fixture",
         subproblems=[
@@ -1134,6 +1751,7 @@ def test_redecomposition_reuses_proved_theorem_instead_of_creating_a2(
     child.status = "proved"
     child.theorems = ["Submission.stable_lemma"]
     decomposition = loaded.models.Decomposition(
+        reference_use=REFERENCE_USE,
         should_split=True,
         rationale="retry with the same theorem identity",
         subproblems=[
@@ -1190,6 +1808,7 @@ def test_integrating_child_unlocks_its_dependent_without_reproving(
     accepted.candidate_commit = "candidate"
     accepted.theorems = ["Submission.accepted_child"]
     decomposition = loaded.models.Decomposition(
+        reference_use=REFERENCE_USE,
         should_split=True,
         rationale="one accepted prerequisite and its dependent",
         subproblems=[
@@ -1228,6 +1847,7 @@ def test_a_spent_budget_in_one_child_stops_the_frontier(
         "root", parent=None, depth=0, title="Root", statement="Root theorem"
     )
     decomposition = loaded.models.Decomposition(
+        reference_use=REFERENCE_USE,
         should_split=True,
         rationale="two independent lemmas",
         subproblems=[_subproblem(loaded, "spent"), _subproblem(loaded, "slow")],
@@ -1283,14 +1903,18 @@ def _agents(
         where = Path(str(session.placement.workdir))
         turns.append(("worker", output_schema, where, prompt))
         opened.append(sum(not one.closed for one in session.driver.sessions))
+        if output_schema is models.FetchedProblem:
+            return fetched_problem(loaded, where.name)
         if output_schema is models.NaturalProof:
             return models.NaturalProof(
+                reference_use=REFERENCE_USE,
                 proof="1. Every step follows from the definitions, so the theorem holds.",
                 key_steps=["unfold the definitions"],
                 unresolved=[],
             )
         if output_schema is models.Decomposition:
             return models.Decomposition(
+                reference_use=REFERENCE_USE,
                 should_split=True,
                 rationale="two reusable lemmas",
                 subproblems=[_subproblem(loaded, "alpha"), _subproblem(loaded, "beta")],
@@ -1313,10 +1937,14 @@ def _agents(
         opened.append(sum(not one.closed for one in session.driver.sessions))
         if output_schema is models.NaturalAudit:
             return models.NaturalAudit(
-                acceptable=True, first_invalid_step="", required_changes=[]
+                reference_use=REFERENCE_USE,
+                acceptable=True,
+                first_invalid_step="",
+                required_changes=[],
             )
         if output_schema is models.DecompositionAudit:
             return models.DecompositionAudit(
+                reference_use=REFERENCE_USE,
                 acceptable=True,
                 nodes=[
                     models.SubproblemAudit(key=key, acceptable=True, reason="sound")
@@ -1331,6 +1959,7 @@ def _agents(
             if node_id == interrupt:
                 raise RuntimeError("interrupted")
             return models.LeanAudit(
+                reference_use=REFERENCE_USE,
                 accepted=True,
                 comparator_reran=True,
                 comparator_passed=True,
@@ -1392,7 +2021,7 @@ def _dag(project: Path) -> dict[str, Any]:
 
 
 def test_a_root_splits_into_two_children_that_are_proved_integrated_and_published(
-    loaded: Any, tmp_path: Path
+    loaded: Any, tmp_path: Path, offline: list[Any]
 ) -> None:
     project = _problem(tmp_path)
     worker, reviewer, turns = _agents(loaded)
@@ -1412,8 +2041,23 @@ def test_a_root_splits_into_two_children_that_are_proved_integrated_and_publishe
         )
     )
 
-    # The DAG: a root and its two children, every one proved.
+    # Preflight came first: the snapshots, then the one problem, frozen in the run.
     run_dir = _run_dir(project)
+    [bundle] = offline
+    assert bundle.root == project / ".humanize" / "math-reference-library"
+    assert json.loads((run_dir / "preflight.json").read_text())["status"] == "ready"
+    problem = (run_dir / "problem.md").read_text()
+    assert problem.startswith("# Mihăilescu's theorem\n")
+    assert "| Problem id | `problem` |" in problem
+    assert json.loads((run_dir / "problem.json").read_text())["problem_id"] == "problem"
+    fetches = [one for one in turns if one[1] is loaded.models.FetchedProblem]
+    assert len(fetches) == 1
+    assert "only permitted problem id: `problem`" in fetches[0][3]
+    reasoning = [prompt for _, schema, _, prompt in turns if schema is not None]
+    assert all(str(run_dir / "problem.md") in one for one in reasoning[1:])
+    assert all(str(bundle.manifest) in one for one in reasoning[1:])
+
+    # The DAG: a root and its two children, every one proved.
     nodes = _dag(project)
     assert set(nodes) == {"root", "root.alpha-a1", "root.beta-a1"}
     assert {one["status"] for one in nodes.values()} == {"proved"}
@@ -1422,6 +2066,8 @@ def test_a_root_splits_into_two_children_that_are_proved_integrated_and_publishe
     assert "n_root --> n_root_alpha_a1" in rendered
     assert "n_root --> n_root_beta_a1" in rendered
     assert rendered.count("| proved |") == 3
+    assert f"Fetched problem: `{run_dir / 'problem.md'}`" in rendered
+    assert f"Reference manifest: `{bundle.manifest}`" in rendered
 
     # Every accepted theorem is in the problem branch, which is clean, and in the wiki.
     for name in ("Alpha.lean", "Beta.lean", "Root.lean"):
@@ -1494,17 +2140,18 @@ def test_a_root_splits_into_two_children_that_are_proved_integrated_and_publishe
     )
     assert len(theirs) == 6
     assert not any(one.skills for one in theirs)
-    # Every turn's session closed with its `turn` call, rather than piling up to the end.
-    assert len(sessions) == 17
+    # Every turn's session closed with its `turn` call, rather than piling up to the end;
+    # the problem was fetched in the one session of its own the run holds itself.
+    assert len(sessions) == 18
     assert max(worker.opened) <= 4  # type: ignore[attr-defined]
-    assert names.count(("turn", 2)) == len(mine)
+    assert names.count(("turn", 2)) == len(mine) - 1
 
     # The scratch directory the worktrees were in went with the run that made it.
     assert not worktrees.exists()
 
 
 def test_an_interrupted_run_resumes_its_dag_from_the_journal(
-    loaded: Any, tmp_path: Path
+    loaded: Any, tmp_path: Path, offline: list[Any]
 ) -> None:
     project = _problem(tmp_path)
     journal = tmp_path / "epic" / "journal.jsonl"
@@ -1557,6 +2204,9 @@ def test_an_interrupted_run_resumes_its_dag_from_the_journal(
     [rebuilt] = [one for one in loaded.calls if one["flow"] == "rlcr"][3:]
     assert rebuilt["workspace"] == str(root_worktree)
     assert not any(schema is loaded.models.NaturalProof for _, schema, _, _ in turns)
+    # The problem frozen by the first run is the one the resumed run works on.
+    assert not any(schema is loaded.models.FetchedProblem for _, schema, _, _ in turns)
+    assert len(offline) == 2
     assert (project / "Root.lean").is_file()
     assert git(project, "status", "--porcelain") == ""
 
@@ -1638,7 +2288,12 @@ def test_a_turn_is_a_call_of_its_own_whose_session_closes_with_it(
         turn(failing(HarnessRefused("logged out")), "NaturalAudit")
 
     # One that answered is read as the schema asked for, and its session is over.
-    passed = {"acceptable": True, "first_invalid_step": "", "required_changes": []}
+    passed = {
+        "reference_use": REFERENCE_USE,
+        "acceptable": True,
+        "first_invalid_step": "",
+        "required_changes": [],
+    }
     answering = FakeAgentDriver(HarnessKind.CODEX, reply=passed)
     audit = turn(answering, "NaturalAudit")
     assert isinstance(audit, loaded.models.NaturalAudit)

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import functools
 import hashlib
+import json
 import os
+import re
 import shlex
 import shutil
 import time
@@ -12,6 +15,8 @@ import traceback
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import pydantic
 from hmz.flows import (
@@ -33,17 +38,30 @@ from . import models
 from .models import (
     Decomposition,
     DecompositionAudit,
+    FetchedProblem,
     LeanAudit,
     NaturalAudit,
     NaturalProof,
     NodeRecord,
     ProvedTheorem,
+    ReferenceUse,
     SolveResult,
     Subproblem,
 )
+from .preflight import (
+    PROBLEM_COLLECTION_URL,
+    PROBLEM_DATA_URL,
+    PROBLEM_PAGE_URL,
+    REFERENCE_SOURCES,
+    ReferenceBundle,
+    ReferenceLibrary,
+    infer_problem_id,
+)
+from .preflight import problem_context as render_problem_context
 from .prompts import (
     DECOMPOSE,
     DECOMPOSITION_AUDIT,
+    FETCH_ONE_PROBLEM,
     INTEGRATION_AUDIT,
     INTEGRATION_REPAIR,
     LEAN_AUDIT,
@@ -80,7 +98,17 @@ INTEGRATION_GIT = (
     "-c",
     "user.email=humanize-recursive@example.invalid",
 )
-STATE = ("version", "task_digest", "run_dir", "last_failure")
+STATE = (
+    "version",
+    "task_digest",
+    "run_dir",
+    "last_failure",
+    "problem_id",
+    "problem_file",
+    "reference_manifest",
+)
+SLUG = 80
+SITE_DATA_LIMIT = 5_000_000
 #: How a turn can fail that another try may not: answered with nothing, as a suppressed turn
 #: always was. A refused credential, a model not served or an unrecoverable turn still raise.
 FAILED_TURN = (
@@ -103,6 +131,14 @@ git merge-file --union -p "$tmp/ours" "$tmp/base" "$tmp/theirs" > "$tmp/merged"
 cat "$tmp/merged" > "$1" || exit 6
 git add -- "$1" || exit 7
 """
+
+
+def _node_identity_slug(value: str) -> str:
+    made = re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-") or "theorem"
+    if len(made) <= SLUG:
+        return made
+    digest = hashlib.sha256(value.encode()).hexdigest()[:10]
+    return f"{made[: SLUG - 11]}-{digest}"
 
 
 def _fatal(error: BaseException) -> bool:
@@ -210,16 +246,34 @@ class Runtime:
             self.project / self.config.wiki_dir,
             self.task,
         )
+        self.problem_id = ""
+        self.problem_path = self.run_root / "problem.md"
+        self.reference_bundle: ReferenceBundle | None = None
 
     async def execute(self) -> None:
         if not self.task:
             raise ValueError("recursive_lean_prover needs a mathematical problem")
         await self._require_git()
         self._require_comparator()
+        await self._seal_agent_workspace(self.workspace)
         await self._worktree_root()
-        latest = self.project / self.config.artifact_dir / "LATEST"
-        atomic_text(latest, str(self.run_root.relative_to(self.project)) + "\n")
+        run_relative = str(self.run_root.relative_to(self.project))
+        self._write_identity(self.run_root)
         self._remember()
+        latest = self.project / self.config.artifact_dir / "LATEST"
+        atomic_text(latest, run_relative + "\n")
+        atomic_text(self._task_pointer(), run_relative + "\n")
+        problem = await self._bootstrap()
+        self.store.problem_artifact = str(self.problem_path)
+        manifest = ""
+        if self.reference_bundle is not None:
+            self.store.reference_manifest = str(self.reference_bundle.manifest)
+            manifest = str(self.reference_bundle.manifest.relative_to(self.project))
+        self._remember(
+            problem_id=problem.problem_id,
+            problem_file=str(self.problem_path.relative_to(self.project)),
+            reference_manifest=manifest,
+        )
         root = self.store.ensure(
             "root",
             parent=None,
@@ -233,6 +287,9 @@ class Runtime:
                 "root", "interrupted", "resuming an interrupted root node"
             )
         print(f"Live DAG: {self.run_root / 'DAG.md'}")
+        print(f"Fetched problem: {self.problem_path}")
+        if self.reference_bundle is not None:
+            print(f"Reference snapshots: {self.reference_bundle.manifest}")
         print(f"Theorem wiki: {self.project / self.config.wiki_dir / 'README.md'}")
         try:
             result = await (
@@ -294,6 +351,456 @@ class Runtime:
                 and time.monotonic() - self._since >= budget.duration.total_seconds()
             )
         )
+
+    async def _bootstrap(self) -> FetchedProblem:
+        self._preflight_status(
+            "downloading-references",
+            "preparing TauCeti, lean-pool, and mathlib-internal",
+        )
+        library = ReferenceLibrary(
+            self.project / self.config.reference_dir,
+            huggingface_token_env=self.config.huggingface_token_env,
+        )
+        self.reference_bundle = await asyncio.to_thread(library.prepare)
+        os.environ.pop(self.config.huggingface_token_env, None)
+        self._preflight_status(
+            "fetching-problem",
+            "three reference snapshots ready; starting isolated one-problem session",
+        )
+        self.problem_id = infer_problem_id(
+            self.project, self.config.problem_id, self.task
+        )
+        fetched = await self._fetched_problem()
+        self._preflight_status(
+            "ready",
+            f"problem {fetched.problem_id} frozen; planning may start",
+        )
+        return fetched
+
+    async def _fetched_problem(self) -> FetchedProblem:
+        lock_path = self.run_root / ".problem-acquisition.lock"
+        with lock_path.open("a+", encoding="utf-8") as lock:
+            await asyncio.to_thread(fcntl.flock, lock.fileno(), fcntl.LOCK_EX)
+            try:
+                return await self._fetched_problem_locked()
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    async def _fetched_problem_locked(self) -> FetchedProblem:
+        site_data = await self._problem_site_data()
+        record_path = self.run_root / "problem.json"
+        candidate_path = self.run_root / "problem-candidate.json"
+        if record_path.is_file() or self.problem_path.is_file():
+            try:
+                source = record_path if record_path.is_file() else candidate_path
+                fetched = FetchedProblem.model_validate_json(
+                    source.read_text(encoding="utf-8")
+                )
+                if self.problem_path.is_file():
+                    markdown = self.problem_path.read_text(encoding="utf-8")
+                else:
+                    markdown = fetched.markdown.rstrip() + "\n"
+                    fetched.markdown = markdown
+                    atomic_text(self.problem_path, markdown)
+            except (OSError, ValueError) as error:
+                raise RuntimeError(
+                    "invalid problem acquisition checkpoint; refusing to select another "
+                    "problem"
+                ) from error
+            if fetched.problem_id != self.problem_id or markdown != fetched.markdown:
+                raise RuntimeError(
+                    "frozen problem checkpoint does not match the selected problem id"
+                )
+            feedback = self._problem_authority_feedback(fetched, site_data)
+            if feedback:
+                raise RuntimeError(
+                    "frozen problem checkpoint disagrees with authoritative site data: "
+                    + feedback
+                )
+            canonical = self._render_problem_markdown(site_data)
+            if fetched.markdown != canonical or markdown != canonical:
+                raise RuntimeError(
+                    "frozen problem Markdown differs from the authoritative rendering"
+                )
+            if not record_path.is_file():
+                atomic_text(record_path, fetched.model_dump_json(indent=2) + "\n")
+            return fetched
+
+        session_path = self.run_root / "problem-session.json"
+        if candidate_path.is_file():
+            try:
+                fetched = FetchedProblem.model_validate_json(
+                    candidate_path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError) as error:
+                raise RuntimeError(
+                    "invalid saved acquisition candidate; refusing a second agent session"
+                ) from error
+        else:
+            if session_path.exists():
+                raise RuntimeError(
+                    "the one permitted acquisition session was interrupted before a valid "
+                    "candidate was saved; refusing to start a second session"
+                )
+            atomic_text(
+                session_path,
+                json.dumps(
+                    {
+                        "problem_id": self.problem_id,
+                        "status": "started",
+                        "started_at": now(),
+                    },
+                    indent=2,
+                )
+                + "\n",
+            )
+            fetched = await self._fetch_one_problem(site_data)
+            atomic_text(candidate_path, fetched.model_dump_json(indent=2) + "\n")
+            atomic_text(
+                session_path,
+                json.dumps(
+                    {
+                        "problem_id": self.problem_id,
+                        "status": "candidate-saved",
+                        "completed_at": now(),
+                    },
+                    indent=2,
+                )
+                + "\n",
+            )
+
+        feedback = self._problem_authority_feedback(fetched, site_data)
+        if feedback:
+            raise RuntimeError(
+                "saved acquisition candidate disagrees with authoritative site data: "
+                + feedback
+            )
+        fetched = FetchedProblem.model_validate(
+            fetched.model_dump()
+            | {"markdown": self._render_problem_markdown(site_data)}
+        )
+        atomic_text(self.problem_path, fetched.markdown.rstrip() + "\n")
+        fetched.markdown = self.problem_path.read_text(encoding="utf-8")
+        atomic_text(record_path, fetched.model_dump_json(indent=2) + "\n")
+        return fetched
+
+    async def _fetch_one_problem(self, site_data: dict[str, Any]) -> FetchedProblem:
+        session = await self.worker.spawn(env=self.workspace)
+        prompt = FETCH_ONE_PROBLEM.format(
+            collection_url=PROBLEM_COLLECTION_URL,
+            problem_id=self.problem_id,
+            problem_url=PROBLEM_PAGE_URL.format(problem_id=self.problem_id),
+            problem_data_url=PROBLEM_DATA_URL.format(problem_id=self.problem_id),
+            request=self.task,
+        )
+        feedback = "None."
+        attempts = self.config.problem_fetch_attempts
+        for _ in range(attempts):
+            try:
+                response = await self.worker.run(
+                    f"{prompt}\n\nValidation feedback from the previous response: "
+                    f"{feedback}",
+                    session=session,
+                    output_schema=FetchedProblem,
+                )
+            except FAILED_TURN as error:
+                print(f"[PREFLIGHT] the problem fetch answered nothing: {error}")
+                if not isinstance(error, OutputSchemaError):
+                    await asyncio.sleep(FAILED_PAUSE)
+                feedback = "No valid structured single-problem record was returned."
+                continue
+            feedback = self._problem_authority_feedback(response, site_data)
+            if not feedback:
+                return FetchedProblem.model_validate(
+                    response.model_dump()
+                    | {"markdown": self._render_problem_markdown(site_data)}
+                )
+        raise RuntimeError(
+            f"single-problem acquisition failed after {attempts} attempt(s): {feedback}"
+        )
+
+    async def _problem_site_data(self) -> dict[str, Any]:
+        path = self.run_root / "problem-site-data.json"
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise RuntimeError("invalid frozen Lean-Eval site-data JSON") from error
+            self._validate_problem_site_data(data)
+            return data
+        url = PROBLEM_DATA_URL.format(problem_id=self.problem_id)
+
+        def download() -> bytes:
+            with urlopen(
+                Request(url, headers={"User-Agent": "math-lean-flow/1"}),
+                timeout=60,
+            ) as response:
+                return response.read(SITE_DATA_LIMIT + 1)
+
+        try:
+            raw = await asyncio.to_thread(download)
+        except (HTTPError, URLError, TimeoutError, OSError) as error:
+            raise RuntimeError(
+                f"could not fetch authoritative problem JSON: {url}"
+            ) from error
+        if len(raw) > SITE_DATA_LIMIT:
+            raise RuntimeError(
+                "authoritative problem JSON exceeds the 5 MB safety limit"
+            )
+        try:
+            data = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                "authoritative problem endpoint returned invalid JSON"
+            ) from error
+        self._validate_problem_site_data(data)
+        atomic_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        return data
+
+    def _validate_problem_site_data(self, data: Any) -> None:
+        if not isinstance(data, dict) or data.get("schema_version") != 2:
+            raise RuntimeError("authoritative problem JSON is not schema version 2")
+        generated_at = data.get("generated_at")
+        problem = data.get("problem")
+        if not isinstance(generated_at, str) or not generated_at.strip():
+            raise RuntimeError("authoritative problem JSON has no generation timestamp")
+        if not isinstance(problem, dict) or problem.get("id") != self.problem_id:
+            raise RuntimeError("authoritative problem JSON has the wrong problem id")
+        if problem.get("stable_url") != f"problems/{self.problem_id}/":
+            raise RuntimeError("authoritative problem JSON has the wrong stable URL")
+        if not isinstance(problem.get("title"), str) or not problem["title"].strip():
+            raise RuntimeError("authoritative problem JSON has no title")
+        revision = problem.get("statement_revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise RuntimeError(
+                "authoritative problem JSON has no valid statement revision"
+            )
+        if not isinstance(problem.get("module"), str) or not problem["module"].strip():
+            raise RuntimeError("authoritative problem JSON has no module")
+
+    def _problem_authority_feedback(
+        self, fetched: FetchedProblem, data: dict[str, Any]
+    ) -> str:
+        problem = data["problem"]
+        expected = {
+            "problem_id": problem["id"],
+            "title": problem["title"],
+            "source_url": PROBLEM_PAGE_URL.format(problem_id=self.problem_id),
+            "data_url": PROBLEM_DATA_URL.format(problem_id=self.problem_id),
+            "generated_at": data["generated_at"],
+            "statement_revision": problem["statement_revision"],
+            "module": problem["module"],
+        }
+        return "; ".join(
+            f"{field} must be {wanted!r}, got {getattr(fetched, field)!r}"
+            for field, wanted in expected.items()
+            if getattr(fetched, field) != wanted
+        )
+
+    def _render_problem_markdown(self, data: dict[str, Any]) -> str:
+        problem = data["problem"]
+
+        def json_block(value: Any) -> str:
+            payload = json.dumps(value, ensure_ascii=False, indent=2).replace(
+                "/", "\\/"
+            )
+            longest = max((len(run) for run in re.findall(r"`+", payload)), default=0)
+            fence = "`" * max(3, longest + 1)
+            return f"{fence}json\n{payload}\n{fence}"
+
+        tags = ", ".join(str(tag) for tag in problem.get("tags", [])) or "None"
+        submitter = problem.get("submitter") or "Not supplied"
+        rows = [
+            f"# {problem['title']}",
+            "",
+            "> Source: [Lean AI formalization leaderboard]"
+            f"({PROBLEM_PAGE_URL.format(problem_id=self.problem_id)})",
+            f"> Crawled from controller-frozen v2 data: {data['generated_at']}",
+            f"> Leaderboard data generated: {data['generated_at']}",
+            "",
+            "## Leaderboard entry",
+            "",
+            "| Field | Value |",
+            "| --- | --- |",
+            f"| Problem id | `{problem['id']}` |",
+            f"| Group | `{problem.get('group', 'Not supplied')}` |",
+            f"| Status | `{problem.get('current_status', 'Not supplied')}` |",
+            f"| Visible | `{problem.get('visible', 'Not supplied')}` |",
+            f"| Statement revision | `{problem['statement_revision']}` |",
+            f"| Author | `{submitter}` |",
+            f"| Module | `{problem['module']}` |",
+            f"| Tags | `{tags}` |",
+            "",
+            "## Problem",
+            "",
+            "The official problem record follows. JSON strings preserve the source text "
+            "exactly.",
+            "",
+            "### Official statement metadata",
+            "",
+            json_block(problem),
+            "",
+            "### Lifecycle",
+            "",
+            json_block(data.get("lifecycle", {})),
+            "",
+            "### Frozen sets",
+            "",
+            json_block(data.get("sets", [])),
+            "",
+            "### Solutions and replay comparison",
+            "",
+            json_block(data.get("solutions", [])),
+            "",
+            "## Trusted local Lean contract",
+            "",
+            "The repository's `Challenge.lean`, `config.json`, `README.md`, configured "
+            "submission target, and comparator are the formal acceptance authority. The "
+            "leaderboard record is problem context and does not weaken those local "
+            "declarations.",
+            "",
+            "## Data limitations",
+            "",
+            "- This page is a deterministic view of the controller-frozen v2 JSON stored "
+            "beside it as `problem-site-data.json`.",
+            "- Missing or null fields mean the Lean-Eval endpoint did not supply that datum.",
+            "- Self-reported solution metadata remains self-reported; replay fields retain "
+            "the endpoint's availability status.",
+            "",
+            "### Additional authoritative v2 fields",
+            "",
+            json_block(
+                {
+                    key: value
+                    for key, value in data.items()
+                    if key
+                    not in {
+                        "schema_version",
+                        "generated_at",
+                        "problem",
+                        "lifecycle",
+                        "sets",
+                        "solutions",
+                    }
+                }
+            ),
+            "",
+        ]
+        return "\n".join(rows)
+
+    def _reference_context(self) -> str:
+        if self.reference_bundle is not None:
+            return self.reference_bundle.prompt_context()
+        root = (self.project / self.config.reference_dir).resolve()
+        return ReferenceBundle(
+            root=root,
+            manifest=root / "manifest.json",
+            paths={
+                source.name: root / source.directory for source in REFERENCE_SOURCES
+            },
+            commits={
+                source.name: "controller-preflight-required"
+                for source in REFERENCE_SOURCES
+            },
+        ).prompt_context()
+
+    def _problem_context(self) -> str:
+        if not self.problem_id:
+            context = (
+                "The controller must freeze exactly one Lean-Eval problem at "
+                f"`{self.problem_path}` before this stage."
+            )
+        else:
+            context = render_problem_context(self.problem_path, self.problem_id)
+        hidden = self.config.agent_hidden_files
+        if hidden:
+            paths = ", ".join(f"`{one}`" for one in hidden)
+            context += (
+                "\n\nComparator-only source boundary: "
+                f"{paths} are deliberately absent from every agent workspace. "
+                "Do not recover or inspect them through Git objects/history, alternate "
+                "worktrees, caches, parent directories, or comparator internals. The exact "
+                "configured comparator is the only authorized consumer."
+            )
+        return context
+
+    def _append_reference_context(self, path: Path) -> None:
+        content = path.read_text(encoding="utf-8").rstrip()
+        atomic_text(
+            path,
+            content
+            + "\n\n## Mandatory reference context\n\n"
+            + self._reference_context()
+            + "\n",
+        )
+
+    @staticmethod
+    def _reference_use_markdown(records: list[ReferenceUse]) -> str:
+        blocks: list[str] = []
+        for record in records:
+            blocks.extend(
+                [
+                    f"### {record.source}",
+                    "",
+                    "Queries:",
+                    *[f"- `{query}`" for query in record.queries],
+                    "",
+                    "Files inspected:",
+                    *[f"- `{inspected}`" for inspected in record.files],
+                    "",
+                    record.conclusion,
+                    "",
+                ]
+            )
+        return "\n".join(blocks).rstrip()
+
+    def _reference_use_problem(self, answer: Any) -> str:
+        if answer is None:
+            return ""
+        records = getattr(answer, "reference_use", None)
+        if records is None:
+            return "structured stage omitted its mandatory reference-use ledger"
+        if self.reference_bundle is None:
+            return "reference-use ledger cannot be checked before reference preflight"
+        for record in records:
+            root = self.reference_bundle.paths[record.source].resolve()
+            valid_path = False
+            for reported in record.files:
+                candidate = Path(reported)
+                if not candidate.is_absolute():
+                    candidate = root / candidate
+                try:
+                    resolved = candidate.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    continue
+                if resolved.is_relative_to(root):
+                    valid_path = True
+                    break
+            if not valid_path:
+                return (
+                    f"reference-use entry for {record.source} did not cite an existing "
+                    f"path inside {root}"
+                )
+        return ""
+
+    def _preflight_status(self, status: str, message: str) -> None:
+        atomic_text(
+            self.run_root / "preflight.json",
+            json.dumps(
+                {
+                    "updated_at": now(),
+                    "status": status,
+                    "message": message,
+                    "required_references": [
+                        source.name for source in REFERENCE_SOURCES
+                    ],
+                    "problem_id": self.problem_id or None,
+                },
+                indent=2,
+            )
+            + "\n",
+        )
+        print(f"[PREFLIGHT] {status} — {message}")
 
     async def _ask(
         self,
@@ -359,6 +866,13 @@ class Runtime:
                 break
             natural = await self._accepted_natural_proof(node, plan, feedback)
             if natural is None:
+                if node.status == "failed":
+                    feedback = node.message or (
+                        "Independent review rejected the frozen child contract."
+                    )
+                    if node.parent:
+                        self._revise_parent(node, feedback)
+                    return SolveResult(ok=False, node_id=node.id, feedback=feedback)
                 feedback = "No complete natural-language proof survived review."
                 continue
             decomposition = await self._decompose(node, natural)
@@ -398,6 +912,8 @@ class Runtime:
         draft = node_dir / f"plan-draft-v{version}.md"
         output = node_dir / f"plan-v{version}.md"
         body = PLAN_DRAFT.format(
+            problem_context=self._problem_context(),
+            reference_context=self._reference_context(),
             statement=node.statement,
             node_id=node.id,
             lean_name=node.lean_name or "to be chosen",
@@ -463,6 +979,7 @@ class Runtime:
                 plan=str(draft.relative_to(self.project)),
             )
             return draft
+        self._append_reference_context(output)
         self.store.update(
             node.id,
             "natural-proof",
@@ -493,6 +1010,8 @@ class Runtime:
                 proof = await self._ask(
                     self.worker,
                     NATURAL_PROOF.format(
+                        problem_context=self._problem_context(),
+                        reference_context=self._reference_context(),
                         statement=node.statement,
                         plan=plan,
                         feedback=feedback,
@@ -520,6 +1039,14 @@ class Runtime:
                     + "\n",
                 )
                 prior_proof = proof.proof
+                reference_problem = self._reference_use_problem(proof)
+                if reference_problem:
+                    feedback = reference_problem
+                    atomic_text(
+                        self._node_dir(node) / f"natural-feedback-v{version}.txt",
+                        feedback + "\n",
+                    )
+                    continue
                 if proof.unresolved:
                     feedback = "Unresolved proof gaps: " + "; ".join(proof.unresolved)
                     atomic_text(
@@ -532,17 +1059,41 @@ class Runtime:
                     "natural-review",
                     f"natural-language RLCR reviewer round {version}",
                 )
-                audit = await self._ask(
-                    self.reviewer,
-                    NATURAL_AUDIT.format(statement=node.statement, proof=proof.proof),
-                    NaturalAudit,
-                )
+                audit = await self._natural_audit(node, proof, version)
                 if audit is not None:
                     atomic_text(
                         self._node_dir(node) / f"natural-audit-v{version}.json",
                         audit.model_dump_json(indent=2) + "\n",
                     )
-                if audit is not None and audit.passed:
+                reference_problem = self._reference_use_problem(audit)
+                if (
+                    audit is not None
+                    and audit.requires_parent_revision
+                    and node.parent is not None
+                    and not reference_problem
+                ):
+                    feedback = "; ".join(
+                        part
+                        for part in (
+                            audit.contract_contradiction.strip(),
+                            self._natural_feedback(audit),
+                        )
+                        if part
+                    )
+                    atomic_text(
+                        self._node_dir(node) / f"natural-feedback-v{version}.txt",
+                        feedback + "\n",
+                    )
+                    self.store.update(
+                        node.id,
+                        "failed",
+                        (
+                            "independent reviewer certified a contradiction in the "
+                            f"frozen child contract: {feedback}"
+                        ),
+                    )
+                    return None
+                if audit is not None and audit.passed and not reference_problem:
                     path = self._node_dir(node) / f"natural-proof-v{version}.md"
                     atomic_text(
                         path,
@@ -552,6 +1103,8 @@ class Runtime:
                             f"{at}. {step}"
                             for at, step in enumerate(proof.key_steps, 1)
                         )
+                        + "\n\n## Reference use\n\n"
+                        + self._reference_use_markdown(proof.reference_use)
                         + "\n",
                     )
                     self.store.update(
@@ -561,7 +1114,7 @@ class Runtime:
                         natural_proof=str(path.relative_to(self.project)),
                     )
                     return proof
-                feedback = self._natural_feedback(audit)
+                feedback = reference_problem or self._natural_feedback(audit)
                 atomic_text(
                     self._node_dir(node) / f"natural-feedback-v{version}.txt",
                     feedback + "\n",
@@ -575,11 +1128,106 @@ class Runtime:
                 ),
             )
 
+    async def _natural_audit(
+        self, node: NodeRecord, proof: NaturalProof, version: int
+    ) -> NaturalAudit | None:
+        review_prompt = NATURAL_AUDIT.format(
+            problem_context=self._problem_context(),
+            reference_context=self._reference_context(),
+            node_id=node.id,
+            node_title=node.title,
+            statement=node.statement,
+            lean_name=node.lean_name,
+            lean_statement=node.lean_statement,
+            proof=proof.proof,
+        )
+        prompt = review_prompt
+        for review_attempt in range(1, self.config.natural_proof_attempts + 1):
+            prompt = review_prompt
+            if review_attempt > 1:
+                self.store.update(
+                    node.id,
+                    "natural-review",
+                    (
+                        "natural-language RLCR reviewer round "
+                        f"{version} retry {review_attempt - 1}"
+                    ),
+                )
+                prompt += (
+                    "\n\nThe previous reviewer call returned no valid "
+                    "NaturalAudit object. Return a concise audit matching the "
+                    "requested schema exactly. Keep `first_invalid_step` and each "
+                    "`required_changes` item focused; do not repeat the proof."
+                )
+                await asyncio.sleep(min(30.0, 15.0 * (review_attempt - 1)))
+            audit = await self._ask(self.reviewer, prompt, NaturalAudit)
+            if audit is not None:
+                return audit
+            atomic_text(
+                self._node_dir(node)
+                / f"natural-review-null-v{version}-attempt-{review_attempt}.txt",
+                "The reviewer returned no structured natural-proof audit.\n",
+            )
+        self.store.update(
+            node.id,
+            "natural-review",
+            f"natural-language RLCR reviewer round {version} JSON transport fallback",
+        )
+        answer = await self._ask(
+            self.reviewer,
+            prompt + "\n\nThe strict structured-output transport did not return a "
+            "valid object. Return exactly one JSON object and no Markdown or "
+            "commentary. It must validate against this JSON Schema:\n"
+            + json.dumps(NaturalAudit.model_json_schema(), indent=2),
+        )
+        audit = self._natural_audit_from_text(answer)
+        atomic_text(
+            self._node_dir(node) / f"natural-review-json-fallback-v{version}.txt",
+            (
+                "The JSON-only transport fallback produced a valid natural-proof audit.\n"
+                if audit is not None
+                else "The JSON-only transport fallback returned no valid "
+                "natural-proof audit.\n"
+            ),
+        )
+        return audit
+
+    @staticmethod
+    def _natural_audit_from_text(answer: Any) -> NaturalAudit | None:
+        if isinstance(answer, NaturalAudit):
+            return answer
+        if not isinstance(answer, str) or not answer.strip():
+            return None
+        stripped = answer.strip()
+        candidates = [stripped]
+        candidates.extend(
+            block.strip()
+            for block in re.findall(
+                r"```(?:json)?\s*(.*?)```",
+                stripped,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        )
+        first, last = stripped.find("{"), stripped.rfind("}")
+        if 0 <= first < last:
+            candidates.append(stripped[first : last + 1])
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                return NaturalAudit.model_validate_json(candidate)
+            except ValueError:
+                continue
+        return None
+
     async def _decompose(
         self, node: NodeRecord, proof: NaturalProof
     ) -> Decomposition | None:
         if node.depth >= self.config.max_depth:
             return Decomposition(
+                reference_use=proof.reference_use,
                 should_split=False,
                 rationale="configured recursion depth reached",
                 subproblems=[],
@@ -595,6 +1243,8 @@ class Runtime:
                 made = await self._ask(
                     self.worker,
                     DECOMPOSE.format(
+                        problem_context=self._problem_context(),
+                        reference_context=self._reference_context(),
                         max_children=self.config.max_children,
                         depth=node.depth,
                         max_depth=self.config.max_depth,
@@ -612,6 +1262,11 @@ class Runtime:
                 continue
             if made is None:
                 feedback = "No valid structured decomposition was returned."
+                self.store.update(node.id, "decomposing", feedback)
+                continue
+            reference_problem = self._reference_use_problem(made)
+            if reference_problem:
+                feedback = reference_problem
                 self.store.update(node.id, "decomposing", feedback)
                 continue
             atomic_text(
@@ -633,6 +1288,8 @@ class Runtime:
                 audit = await self._ask(
                     self.reviewer,
                     DECOMPOSITION_AUDIT.format(
+                        problem_context=self._problem_context(),
+                        reference_context=self._reference_context(),
                         statement=node.statement,
                         proof=proof.proof,
                         decomposition=made.model_dump_json(indent=2),
@@ -649,6 +1306,11 @@ class Runtime:
             audited_keys = [one.key for one in audit.nodes] if audit is not None else []
             if audit is None:
                 feedback = "The reviewer returned no decomposition audit."
+                self.store.update(node.id, "decomposing", feedback)
+                continue
+            reference_problem = self._reference_use_problem(audit)
+            if reference_problem:
+                feedback = reference_problem
                 self.store.update(node.id, "decomposing", feedback)
                 continue
             atomic_text(
@@ -984,7 +1646,18 @@ class Runtime:
             proof = natural_path.read_text(encoding="utf-8").strip()
         except OSError as error:
             return SolveResult(ok=False, node_id=node.id, feedback=str(error))
+        reference_use = self._accepted_reference_use(node)
+        if reference_use is None:
+            return SolveResult(
+                ok=False,
+                node_id=node.id,
+                feedback=(
+                    "accepted natural proof lacks the mandatory three-source "
+                    "reference-use ledger"
+                ),
+            )
         natural = NaturalProof(
+            reference_use=reference_use,
             proof=proof,
             key_steps=["Use the preserved independently accepted natural proof."],
             unresolved=[],
@@ -1283,6 +1956,8 @@ class Runtime:
             proof_base_commit=before,
         )
         task = RLCR_LEAN_TASK.format(
+            problem_context=self._problem_context(),
+            reference_context=self._reference_context(),
             node_id=node.id,
             plan_path=plan_path,
             natural_path=natural_path,
@@ -1345,6 +2020,8 @@ class Runtime:
         audit = await self._ask(
             self.reviewer,
             LEAN_AUDIT.format(
+                problem_context=self._problem_context(),
+                reference_context=self._reference_context(),
                 node_id=node.id,
                 statement=node.statement,
                 lean_statement=node.lean_statement or ROOT_TYPE,
@@ -1363,11 +2040,12 @@ class Runtime:
                 self._node_dir(node) / f"lean-audit-v{audit_version}.json",
                 audit.model_dump_json(indent=2) + "\n",
             )
-        if audit is None or not audit.passed:
+        reference_problem = self._reference_use_problem(audit)
+        if audit is None or not audit.passed or reference_problem:
             return SolveResult(
                 ok=False,
                 node_id=node.id,
-                feedback=self._lean_feedback(audit),
+                feedback=reference_problem or self._lean_feedback(audit),
             )
         self.store.update(
             node.id,
@@ -1412,11 +2090,16 @@ class Runtime:
             "HUMANIZE_NODE_ID": node.id,
             "HUMANIZE_NODE_STATEMENT": node.statement,
             "HUMANIZE_LEAN_FILES": os.pathsep.join(lean_files),
+            "HUMANIZE_CANDIDATE_BASE_COMMIT": node.proof_base_commit,
             "HUMANIZE_RUN_DIR": str(self.run_root),
             "HUMANIZE_WIKI_DIR": str(self.store.wiki),
+            "HUMANIZE_PROBLEM_MARKDOWN": str(self.problem_path),
+            "HUMANIZE_REFERENCE_MANIFEST": self._reference_manifest(),
         }
         argv = [
             "env",
+            "-u",
+            self.config.huggingface_token_env,
             *(f"{name}={value}" for name, value in variables.items()),
             *shlex.split(rendered),
         ]
@@ -1455,10 +2138,22 @@ class Runtime:
 
     def _review_command(self, node: NodeRecord, lean_files: list[str]) -> str:
         environment = (
+            "HUMANIZE_CANDIDATE_BASE_COMMIT="
+            f"{shlex.quote(node.proof_base_commit)} "
             f"HUMANIZE_RUN_DIR={shlex.quote(str(self.run_root))} "
-            f"HUMANIZE_WIKI_DIR={shlex.quote(str(self.store.wiki))}"
+            f"HUMANIZE_WIKI_DIR={shlex.quote(str(self.store.wiki))} "
+            f"HUMANIZE_PROBLEM_MARKDOWN={shlex.quote(str(self.problem_path))} "
+            f"HUMANIZE_REFERENCE_MANIFEST={shlex.quote(self._reference_manifest())}"
         )
-        return f"env {environment} {self._render_command(node, lean_files)}"
+        return (
+            f"env -u {shlex.quote(self.config.huggingface_token_env)} {environment} "
+            f"{self._render_command(node, lean_files)}"
+        )
+
+    def _reference_manifest(self) -> str:
+        if self.reference_bundle is None:
+            return ""
+        return str(self.reference_bundle.manifest)
 
     async def _run_rlcr(
         self,
@@ -1602,14 +2297,71 @@ class Runtime:
                         f"could not check out node branch {branch}: "
                         f"{(err or out).strip()}"
                     )
-        await self._prepare_lake_workspace(worktree)
+        await self._prepare_agent_worktree(worktree)
         return worktree
+
+    async def _prepare_agent_worktree(self, env: Any) -> None:
+        await self._seal_agent_workspace(env)
+        await self._prepare_lake_workspace(env)
+
+    async def _seal_agent_workspace(self, env: Any) -> None:
+        hidden = self.config.agent_hidden_files
+        if not hidden:
+            return
+        root = Path(str(env.workdir)).resolve()
+        status_before = await self._git_status_snapshot(env)
+        for relative in hidden:
+            target = (root / relative).resolve(strict=False)
+            if not target.is_relative_to(root):
+                raise RuntimeError(f"unsafe agent-hidden path: {relative}")
+            tracked, _, _ = await env.exec(
+                ["git", "ls-files", "--error-unmatch", "--", relative]
+            )
+            if tracked:
+                raise RuntimeError(
+                    f"agent-hidden file is not tracked in this worktree: {relative}"
+                )
+            changed, _, _ = await env.exec(
+                ["git", "diff", "--quiet", "HEAD", "--", relative]
+            )
+            if changed:
+                raise RuntimeError(
+                    f"agent-hidden file differs from HEAD; refusing to conceal it: {relative}"
+                )
+            skipped, out, err = await _finished(
+                env.exec(["git", "update-index", "--skip-worktree", "--", relative])
+            )
+            if skipped:
+                raise RuntimeError(
+                    f"could not protect {relative}: {(err or out).strip()}"
+                )
+            if target.is_dir() and not target.is_symlink():
+                raise RuntimeError(f"agent-hidden path is not a file: {relative}")
+            if target.exists() or target.is_symlink():
+                target.unlink()
+            if target.exists() or target.is_symlink():
+                raise RuntimeError(f"agent-hidden file remains visible: {relative}")
+        if await self._git_status_snapshot(env) != status_before:
+            raise RuntimeError(
+                "protecting comparator-only files dirtied the Git worktree"
+            )
+
+    @staticmethod
+    async def _git_status_snapshot(env: Any) -> str:
+        code, out, err = await env.exec(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"]
+        )
+        if code:
+            raise RuntimeError(
+                f"could not inspect Git worktree status: {(err or out).strip()}"
+            )
+        return out
 
     def _node_worktree_path(self, node: NodeRecord, root: Path) -> Path:
         descriptive = (
             root
             / self.run_root.name
-            / slug(node.id)
+            / _node_identity_slug(node.id)
             / f"attempt-{max(node.attempts, 1)}"
             / self.project.name
         )
@@ -1661,7 +2413,7 @@ class Runtime:
         return (
             "humanize-recursive/"
             f"{slug(self.project.name)}/{slug(self.run_root.name)}/"
-            f"{slug(node.id)}-a{max(node.attempts, 1)}"
+            f"{_node_identity_slug(node.id)}-a{max(node.attempts, 1)}"
         )
 
     async def _integrate_reviewed_candidate(
@@ -1759,7 +2511,7 @@ class Runtime:
                     temporary.rmdir()
                 return False, f"could not create integration recheck worktree: {error}"
             try:
-                await self._prepare_lake_workspace(integration)
+                await self._prepare_agent_worktree(integration)
                 applied, unioned, detail = await self._apply_candidate_commits(
                     integration, commits
                 )
@@ -1855,6 +2607,8 @@ class Runtime:
                 ),
             )
             prompt = INTEGRATION_REPAIR.format(
+                problem_context=self._problem_context(),
+                reference_context=self._reference_context(),
                 node_id=node.id,
                 statement=node.statement,
                 lean_statement=node.lean_statement or ROOT_TYPE,
@@ -1890,6 +2644,8 @@ class Runtime:
             audit = await self._ask(
                 self.reviewer,
                 INTEGRATION_AUDIT.format(
+                    problem_context=self._problem_context(),
+                    reference_context=self._reference_context(),
                     node_id=node.id,
                     statement=node.statement,
                     lean_statement=node.lean_statement or ROOT_TYPE,
@@ -1908,8 +2664,9 @@ class Runtime:
                     / f"integration-lean-audit-v{audit_version}.json",
                     audit.model_dump_json(indent=2) + "\n",
                 )
-            if audit is None or not audit.passed:
-                feedback = self._lean_feedback(audit)
+            reference_problem = self._reference_use_problem(audit)
+            if audit is None or not audit.passed or reference_problem:
+                feedback = reference_problem or self._lean_feedback(audit)
                 continue
             if not await self._git_clean(integration):
                 feedback = "integration reviewer modified the reviewed worktree"
@@ -2065,22 +2822,102 @@ class Runtime:
                 raise ValueError(f"comparator script not found: {argv[1]}")
 
     def _run_root(self) -> Path:
+        artifact_root = (self.project / self.config.artifact_dir).resolve()
+        lock_root = artifact_root / ".run-selection"
+        lock_root.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_root / f"{self._task_digest()}.lock"
+        with lock_path.open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                return self._run_root_locked(artifact_root)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _run_root_locked(self, artifact_root: Path) -> Path:
         digest = self._task_digest()
-        previous = self._recalled("run_dir")
-        if (
-            self._recalled("version") == 1
-            and self._recalled("task_digest") == digest
-            and isinstance(previous, str)
-            and (self.project / previous).is_dir()
-        ):
-            return (self.project / previous).resolve()
+
+        def validated(relative: Any) -> Path | None:
+            if not isinstance(relative, str) or not relative.strip():
+                return None
+            relative = relative.strip()
+            if Path(relative).is_absolute():
+                return None
+            candidate = (self.project / relative).resolve()
+            if not candidate.is_relative_to(artifact_root) or not candidate.is_dir():
+                return None
+            try:
+                identity = json.loads(
+                    (candidate / "run.json").read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError, TypeError):
+                return None
+            if (
+                not isinstance(identity, dict)
+                or identity.get("version") != 1
+                or identity.get("task_digest") != digest
+                or identity.get("run_dir") != relative
+            ):
+                return None
+            return candidate
+
+        if self._recalled("version") == 1 and self._recalled("task_digest") == digest:
+            candidate = validated(self._recalled("run_dir"))
+            if candidate is not None:
+                return candidate
+        for pointer in (self._task_pointer(), artifact_root / "LATEST"):
+            try:
+                candidate = validated(pointer.read_text(encoding="utf-8"))
+            except OSError:
+                candidate = None
+            if candidate is not None:
+                return candidate
+        runs = artifact_root / "runs"
+        if runs.is_dir():
+            identities = sorted(
+                runs.glob("*/run.json"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for identity in identities:
+                candidate = validated(str(identity.parent.relative_to(self.project)))
+                if candidate is not None:
+                    return candidate
         stamp = now().replace(":", "").replace("-", "")
-        return (
+        candidate = (
             self.project / self.config.artifact_dir / "runs" / f"{stamp}-{digest[:10]}"
+        )
+        candidate.mkdir(parents=True, exist_ok=True)
+        self._write_identity(candidate)
+        atomic_text(
+            self._task_pointer(), str(candidate.relative_to(self.project)) + "\n"
+        )
+        return candidate.resolve()
+
+    def _write_identity(self, run_dir: Path) -> None:
+        identity = {
+            "version": 1,
+            "task_digest": self._task_digest(),
+            "run_dir": str(run_dir.relative_to(self.project)),
+            "created_at": now(),
+        }
+        atomic_text(run_dir / "run.json", json.dumps(identity, indent=2) + "\n")
+
+    def _task_pointer(self) -> Path:
+        return (
+            self.project
+            / self.config.artifact_dir
+            / "runs-by-task"
+            / f"{self._task_digest()}.run"
         )
 
     def _node_dir(self, node: NodeRecord) -> Path:
-        path = self.run_root / "nodes" / slug(node.id)
+        legacy = self.run_root / "nodes" / slug(node.id)
+        identity = self.run_root / "nodes" / _node_identity_slug(node.id)
+        path = (
+            identity
+            if identity == legacy or identity.exists() or not legacy.exists()
+            else legacy
+        )
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -2094,6 +2931,14 @@ class Runtime:
     ) -> Path:
         path = self._node_dir(node) / f"rlcr-plan-v{node.attempts}.md"
         content = f"""# Implement Lean DAG node `{node.id}`
+
+## Frozen problem acquisition
+
+{self._problem_context()}
+
+## Mandatory research sources
+
+{self._reference_context()}
 
 ## Authoritative selected-node contract
 
@@ -2144,7 +2989,9 @@ not blockers for completion of this implementation-only plan.
         return path
 
     def _task_digest(self) -> str:
-        return hashlib.sha256(self.task.encode()).hexdigest()
+        problem = self.config.problem_id.strip()
+        material = f"{problem}\0{self.task}" if problem else self.task
+        return hashlib.sha256(material.encode()).hexdigest()
 
     def _root_lean_name(self) -> str:
         if self.config.lean_target:
@@ -2203,6 +3050,19 @@ not blockers for completion of this implementation-only plan.
         except OSError:
             feedback = "Continue from this latest preserved draft."
         return proof, feedback or "Continue from this latest preserved draft."
+
+    def _accepted_reference_use(self, node: NodeRecord) -> list[ReferenceUse] | None:
+        if not node.natural_proof:
+            return None
+        match = re.search(r"natural-proof-v(\d+)\.md$", node.natural_proof)
+        if match is None:
+            return None
+        record = self._node_dir(node) / f"natural-proof-draft-v{match.group(1)}.json"
+        try:
+            proof = NaturalProof.model_validate_json(record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return proof.reference_use
 
     def _preserved_plan(self, node: NodeRecord) -> Path | None:
         node_dir = self._node_dir(node)

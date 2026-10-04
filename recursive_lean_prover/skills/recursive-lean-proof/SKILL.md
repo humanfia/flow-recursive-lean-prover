@@ -7,6 +7,37 @@ description: Prove a mathematical statement in natural language before Lean, fac
 
 Keep the mathematical statement fixed. A proof is not a proof of a nearby easier theorem.
 
+Before planning, the controller must complete both preflight gates. First, download or reuse exact
+Git snapshots of TauCeti, lean-pool, and `humanfia-lab/mathlib-internal`, recording their commits in
+the first reference manifest and exposing them as read-only evidence. Reuse is allowed only when
+origin, clean status, HEAD, sentinels, and read-only permissions still match that manifest. The
+Hugging Face token must come only from the configured environment
+variable and must never appear in a task, prompt, param value, manifest, log, subprocess argument,
+or remote URL. Second, resolve one Lean-Eval problem id before opening a dedicated fresh acquisition
+session. That session may fetch only the matching canonical problem page and JSON and returns one
+structured object. Independently retain the v2 site-data JSON and compare the agent's identity,
+title, revision, module, and generation timestamp with it. Deterministically render all official
+Markdown sections from that complete frozen JSON, then freeze exactly one validated `problem.md`;
+never let the model choose an arbitrary catalog entry, combine problems, start a second acquisition
+session after an interrupted first one, or replace the artifact on resume.
+
+At every subsequent agent stage—direct planning, natural-proof authoring and review,
+decomposition and review, Lean RLCR implementation and its reviews, and integration-only repair
+and review—read the frozen problem artifact and consult all three local reference snapshots.
+Search every corpus separately. Record exact queries and local files plus the relevant conclusion;
+an explicit no-relevant-match result is valid, silently omitting a corpus is not. Structured stage
+responses must contain exactly one `reference_use` entry for each of `TauCeti`, `lean-pool`, and
+`mathlib-internal`. Markdown plans and RLCR summaries must contain the equivalent `Reference use`
+section. References are evidence and examples: the local Challenge declarations and configured
+comparator remain the theorem authority, and material from a different toolchain or problem must
+not be copied without compatibility and provenance checks.
+
+Files listed in `agent_hidden_files` are comparator-only sources. The controller removes them
+from the main checkout and every node or integration worktree before an agent session begins.
+Never recover or inspect them through Git objects/history, alternate worktrees, caches, parent
+directories, or comparator internals. Only the exact configured synchronous comparator may stage
+and consume their committed blobs, and it must remove them again before returning control.
+
 Before writing new or revised Lean:
 
 1. Give a numbered natural-language proof.
@@ -24,6 +55,13 @@ accept them. The approved-child list governs new candidate histories overlaid af
 is not an exhaustive allowlist of declarations in the base, and an empty child list does not ban
 base helpers. Do not reuse an unapproved previous proof of the current node, a placeholder, a new
 axiom, or a candidate history absent from both the frozen base and approved children.
+
+When formalizing a child, remember that the repository may still contain participant-side
+`sorry`/`admit` stubs for ancestors that have not reached Lean yet. If the configured source-safety
+scan covers such a stub, remove the entire unproved placeholder declaration before running the
+child comparator. Do not synthesize a fake proof, change a trusted challenge file, or remove any
+comparator-approved declaration. The parent formalization will add its real declaration after its
+approved children have been integrated.
 
 At the natural-language proof review gate, audit the mathematical argument and every stated
 lemma, but do not require child Lean declarations or frozen Lean type expressions yet. Those are
