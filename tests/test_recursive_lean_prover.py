@@ -295,7 +295,7 @@ def git(cwd: Path, *arguments: str) -> str:
 def repository(
     project: Path,
     *,
-    ignore: str = ".humanize/\n.lake/\n",
+    ignore: str = ".hmz/\n.lake/\n",
     submission: str = "namespace Submission\nend Submission\n",
     author: str = "Flow Test",
 ) -> Path:
@@ -420,7 +420,7 @@ def test_params_are_read_as_command_line_values(loaded: Any) -> None:
     assert config.stop_on_child_failure is False
     with pytest.raises(ParamsError, match="max_nodes >= 3"):
         loaded.entry.params_of({"max_depth": "1", "max_nodes": "2"})
-    with pytest.raises(ParamsError, match=r"below \.humanize/"):
+    with pytest.raises(ParamsError, match=r"below \.hmz/"):
         loaded.entry.params_of({"artifact_dir": "/tmp/elsewhere"})
     with pytest.raises(ParamsError, match=r"must name a \.lean file"):
         loaded.entry.params_of({"lean_target": "Submission.txt"})
@@ -547,7 +547,7 @@ def test_nested_plan_cannot_reopen_accepted_decomposition(
 
 def test_node_commit_is_isolated_then_integrated(loaded: Any, tmp_path: Path) -> None:
     project = repository(
-        tmp_path / "example_problem", ignore=".humanize/\n.lake/\n/lake-manifest.json\n"
+        tmp_path / "example_problem", ignore=".hmz/\n.lake/\n/lake-manifest.json\n"
     )
     (project / ".lake" / "packages").mkdir(parents=True)
     (project / "lake-manifest.json").write_text(
@@ -603,7 +603,7 @@ def test_node_worktree_finds_manifest_in_primary_git_worktree(
 ) -> None:
     primary = repository(
         tmp_path / "primary",
-        ignore=".humanize/\n.lake/\n/lake-manifest.json\n",
+        ignore=".hmz/\n.lake/\n/lake-manifest.json\n",
         submission="theorem seed : True := by trivial\n",
     )
     expected = '{"version": "1.1.0", "packages": []}\n'
@@ -667,7 +667,7 @@ def test_worktree_rlcr_copies_the_manifest_and_calls_rlcr_in_process(
     loaded: Any, tmp_path: Path
 ) -> None:
     primary = repository(
-        tmp_path / "primary", ignore=".humanize/\n.lake/\n/lake-manifest.json\n"
+        tmp_path / "primary", ignore=".hmz/\n.lake/\n/lake-manifest.json\n"
     )
     expected = '{"version": "1.1.0", "packages": []}\n'
     (primary / "lake-manifest.json").write_text(expected)
@@ -1382,7 +1382,7 @@ def _problem(tmp_path: Path) -> Path:
 
 
 def _run_dir(project: Path) -> Path:
-    latest = project / ".humanize" / "recursive-lean-prover" / "LATEST"
+    latest = project / ".hmz" / "recursive-lean-prover" / "LATEST"
     return project / latest.read_text().strip()
 
 
@@ -1428,7 +1428,7 @@ def test_a_root_splits_into_two_children_that_are_proved_integrated_and_publishe
         assert (project / name).is_file()
     assert git(project, "status", "--porcelain") == ""
     assert git(project, "branch", "--show-current") == "main"
-    wiki = project / ".humanize" / "math-wiki"
+    wiki = project / ".hmz" / "math-wiki"
     for name in ("alpha", "beta", "root"):
         page = (wiki / f"submission-{name}.md").read_text()
         assert f"# `Submission.{name}`" in page

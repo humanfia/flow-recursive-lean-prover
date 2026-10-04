@@ -60,13 +60,13 @@ jobs:
       # tests/test_humanize1_contract.py.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: humanfia/flow-humanize1
-          ref: v0.1.0
-          path: .deps/flow-humanize1
+          repository: humanfia/humanize1-flow
+          ref: v0.1.1
+          path: .deps/humanize1-flow
           persist-credentials: false
 
       - run: uv sync --locked
 
       - run: uv run --locked pytest
         env:
-          HUMANIZE1_CHECKOUT: ${{ github.workspace }}/.deps/flow-humanize1
+          HUMANIZE1_CHECKOUT: ${{ github.workspace }}/.deps/humanize1-flow

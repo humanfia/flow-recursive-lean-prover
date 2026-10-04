@@ -161,11 +161,11 @@ class Config(FlowParams):
         description="seconds allowed for each independent comparator run",
     )
     artifact_dir: str = Field(
-        default=".humanize/recursive-lean-prover",
+        default=".hmz/recursive-lean-prover",
         description="untracked directory for plans, proofs, DAGs, logs, and run state",
     )
     wiki_dir: str = Field(
-        default=".humanize/math-wiki",
+        default=".hmz/math-wiki",
         description="Markdown wiki receiving every comparator-approved theorem",
     )
     lean_target: str = Field(
@@ -191,8 +191,8 @@ class Config(FlowParams):
     @classmethod
     def _local_state(cls, value: str) -> str:
         normalized = value.strip().rstrip("/")
-        if not normalized.startswith(".humanize/"):
-            raise ValueError("must be a relative path below .humanize/")
+        if not normalized.startswith(".hmz/"):
+            raise ValueError("must be a relative path below .hmz/")
         if ".." in normalized.split("/"):
             raise ValueError("must not contain '..'")
         return normalized
