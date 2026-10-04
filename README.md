@@ -1,4 +1,4 @@
-# recursive_lean_prover _(flow-recursive-lean-prover)_
+# recursive_lean_prover _(recursive-lean-prover-flow)_
 
 Recursive Lean Prover for hmz: recursively plan, prove, compare, review and catalogue Lean theorems.
 
@@ -106,7 +106,7 @@ offline-reproducible and prevents Lake from trying to update shared read-only Gi
 
 You need [hmz](https://github.com/humanfia/humanize). In hmz, open `/flow`, go to
 **Flowverses → official → recursive_lean_prover** and **Install** it. It needs
-[`humanize1`](https://github.com/humanfia/flow-humanize1) `>=0.1.1,<0.2.0`, which hmz installs
+[`humanize1`](https://github.com/humanfia/humanize1-flow) `>=0.1.1,<0.2.0`, which hmz installs
 with it: the flow calls `humanize1:gen-plan` and `humanize1:rlcr` by name, and hmz looks for a
 name among the flows installed beside the one asking first.
 
@@ -114,10 +114,10 @@ To run a checkout of your own, keep `recursive_lean_prover` and `humanize1` side
 directory of flows and name the flow by its path:
 
 ```sh
-git clone --branch v0.1.1 https://github.com/humanfia/flow-recursive-lean-prover
-git clone --branch v0.1.1 https://github.com/humanfia/flow-humanize1
+git clone --branch v0.1.1 https://github.com/humanfia/recursive-lean-prover-flow
+git clone --branch v0.1.1 https://github.com/humanfia/humanize1-flow
 mkdir -p flows
-cp -R flow-recursive-lean-prover/recursive_lean_prover flow-humanize1/humanize1 flows/
+cp -R recursive-lean-prover-flow/recursive_lean_prover humanize1-flow/humanize1 flows/
 hmz exec -f ./flows/recursive_lean_prover ...
 ```
 
@@ -128,7 +128,7 @@ Copy rather than link the flow: hmz reads the flows beside it from where its fil
 ### Requirements
 
 - Humanize with the new flow API (`hmz exec -a/-e/-p`).
-- [`humanize1`](https://github.com/humanfia/flow-humanize1) installed beside it, whose
+- [`humanize1`](https://github.com/humanfia/humanize1-flow) installed beside it, whose
   `gen-plan` and `rlcr` it calls by those names (see [Install](#install)).
 - Lean projects should pin `leanprover/lean4:v4.33.0` in `lean-toolchain` when reproducing the
   current Lean-Eval experiment.
@@ -325,8 +325,8 @@ The tests run the flow on fake agents over real git repositories, beside a stand
 from a checkout named by `HUMANIZE1_CHECKOUT`:
 
 ```sh
-git clone --branch v0.1.1 https://github.com/humanfia/flow-humanize1 .deps/flow-humanize1
-HUMANIZE1_CHECKOUT=.deps/flow-humanize1 uv run pytest
+git clone --branch v0.1.1 https://github.com/humanfia/humanize1-flow .deps/humanize1-flow
+HUMANIZE1_CHECKOUT=.deps/humanize1-flow uv run pytest
 ```
 
 CI runs the same on every pull request. A release is a `vX.Y.Z` tag on `main`; it reaches hmz

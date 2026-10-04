@@ -2,7 +2,7 @@
 
 `test_recursive_lean_prover.py` runs the flow beside a stand-in that declares the interface of
 `humanize1:gen-plan` and `humanize1:rlcr`. This holds that stand-in to a checkout of
-humanfia/flow-humanize1 at the tag the flow is pinned to, put beside the flow as hmz installs
+humanfia/humanize1-flow at the tag the flow is pinned to, put beside the flow as hmz installs
 the two, and resolved from inside the flow by the refs it calls them by. The checkout is
 named by `HUMANIZE1_CHECKOUT`, which CI fetches before the tests run; without one this is
 skipped.
@@ -27,7 +27,7 @@ CHECKOUT = os.environ.get("HUMANIZE1_CHECKOUT", "")
 
 pytestmark = pytest.mark.skipif(
     not CHECKOUT,
-    reason="HUMANIZE1_CHECKOUT names no checkout of humanfia/flow-humanize1 at its pinned tag",
+    reason="HUMANIZE1_CHECKOUT names no checkout of humanfia/humanize1-flow at its pinned tag",
 )
 
 IGNORED = shutil.ignore_patterns("__pycache__")

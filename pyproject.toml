@@ -1,5 +1,5 @@
 [project]
-name = "flow-recursive-lean-prover"
+name = "recursive-lean-prover-flow"
 version = "0.1.1"
 description = "Recursive Lean Prover for hmz: recursively plan, prove, compare, review and catalogue Lean theorems."
 readme = "README.md"
@@ -9,8 +9,8 @@ license-files = ["LICENSE"]
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/humanfia/flow-recursive-lean-prover"
-Issues = "https://github.com/humanfia/flow-recursive-lean-prover/issues"
+Repository = "https://github.com/humanfia/recursive-lean-prover-flow"
+Issues = "https://github.com/humanfia/recursive-lean-prover-flow/issues"
 
 [dependency-groups]
 dev = [
