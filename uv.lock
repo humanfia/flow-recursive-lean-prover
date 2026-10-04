@@ -46,7 +46,7 @@ wheels = [
 
 [[package]]
 name = "flow-recursive-lean-prover"
-version = "0.1.0"
+version = "0.1.1"
 source = { virtual = "." }
 
 [package.dev-dependencies]
@@ -72,7 +72,7 @@ dev = [
 [[package]]
 name = "hmz"
 version = "0.1.0"
-source = { git = "https://github.com/humanfia/humanize#68f036dc47bf967f535ba3e9b416e3b2dcab6e3a" }
+source = { git = "https://github.com/humanfia/humanize#a90c1a1add23d317b2ccd2c774a8f3dcaf71f46c" }
 dependencies = [
     { name = "dateparser" },
     { name = "psutil" },

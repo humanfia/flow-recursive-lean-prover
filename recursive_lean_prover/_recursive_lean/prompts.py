@@ -180,7 +180,7 @@ Requirements:
   Do not run the official root/whole-benchmark comparator or validate unrelated parent or sibling
   theorems; those checks consume the shared build pool and are outside this node's boundary.
 - Commit only real Lean/project changes with a conventional descriptive commit.
-- Do not edit anything under `.humanize/` except files the RLCR runtime itself requires.
+- Do not edit anything under `.hmz/` except files the RLCR runtime itself requires.
 
 This nested RLCR stage owns only implementation, a warning-clean build, a clean committed
 candidate, and the author's comparator run. Return successfully as soon as those are complete.
@@ -249,7 +249,7 @@ Inspect the current Git state and preserve every theorem and sound change from b
 Resolve merge conflicts, module/import ordering, duplicate declarations, and combined-build
 incompatibilities without deleting an accepted theorem or changing a challenge declaration.
 Do not edit the plan, natural-language proof, challenge files, comparator, or anything under
-`.humanize/`. No `sorry`, `admit`, new axiom, unsafe loophole, weakened theorem, or prohibited
+`.hmz/`. No `sorry`, `admit`, new axiom, unsafe loophole, weakened theorem, or prohibited
 import is allowed. Run this exact comparator until it exits zero and prints `{comparator_success}`:
 
 {comparator_command}

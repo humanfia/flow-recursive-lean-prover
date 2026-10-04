@@ -104,18 +104,18 @@ offline-reproducible and prevents Lake from trying to update shared read-only Gi
 
 ## Install
 
-You need [hmz](https://github.com/humanfia/humanize). In hmz, open `/flows`, go to
-**Flowverses → official → recursive_lean_prover**, pick a version and install it. It needs
-[`humanize1`](https://github.com/humanfia/flow-humanize1) `>=0.1.0,<0.2.0` installed too, the
-same way: the flow calls `humanize1:gen-plan` and `humanize1:rlcr` by name, and hmz looks for a
+You need [hmz](https://github.com/humanfia/humanize). In hmz, open `/flow`, go to
+**Flowverses → official → recursive_lean_prover** and **Install** it. It needs
+[`humanize1`](https://github.com/humanfia/flow-humanize1) `>=0.1.1,<0.2.0`, which hmz installs
+with it: the flow calls `humanize1:gen-plan` and `humanize1:rlcr` by name, and hmz looks for a
 name among the flows installed beside the one asking first.
 
 To run a checkout of your own, keep `recursive_lean_prover` and `humanize1` side by side in one
 directory of flows and name the flow by its path:
 
 ```sh
-git clone --branch v0.1.0 https://github.com/humanfia/flow-recursive-lean-prover
-git clone --branch v0.1.0 https://github.com/humanfia/flow-humanize1
+git clone --branch v0.1.1 https://github.com/humanfia/flow-recursive-lean-prover
+git clone --branch v0.1.1 https://github.com/humanfia/flow-humanize1
 mkdir -p flows
 cp -R flow-recursive-lean-prover/recursive_lean_prover flow-humanize1/humanize1 flows/
 hmz exec -f ./flows/recursive_lean_prover ...
@@ -127,12 +127,12 @@ Copy rather than link the flow: hmz reads the flows beside it from where its fil
 
 ### Requirements
 
-- Humanize with the new flow API (`hmz exec -a/-e/-p/-b`).
+- Humanize with the new flow API (`hmz exec -a/-e/-p`).
 - [`humanize1`](https://github.com/humanfia/flow-humanize1) installed beside it, whose
   `gen-plan` and `rlcr` it calls by those names (see [Install](#install)).
 - Lean projects should pin `leanprover/lean4:v4.33.0` in `lean-toolchain` when reproducing the
   current Lean-Eval experiment.
-- Run at the root of a clean Lean git repository that ignores `.humanize/`.
+- Run at the root of a clean Lean git repository that ignores `.hmz/`.
 - Provide a comparator wrapper such as `tools/check-with-comparator.sh`.
 - The comparator must exit zero and print the configured success marker.
 - Use Codex for both roles, `worker` and `reviewer`. They are separate agents, and every turn
@@ -176,7 +176,7 @@ hmz exec -f recursive_lean_prover \
   -a reviewer=codex/gpt-5.6-sol:max \
   -p lean_target=Submission.lean \
   -p 'comparator_command=bash tools/check-with-comparator.sh' \
-  -b duration=72h \
+  -p budget.duration=72h \
   "$(cat PROBLEM.md)"
 ```
 
@@ -200,8 +200,8 @@ takes no `-e`. Every param has a default and is set with `-p <name>=<value>`:
 | `lean_target` | blank | Project-relative candidate `.lean` file; blank lets the worker infer it. |
 | `comparator_command` | `bash tools/check-with-comparator.sh` | The comparator, split like argv and run with no shell. |
 | `comparator_success` | `Your solution is okay!` | Text successful comparator output must contain. |
-| `artifact_dir` | `.humanize/recursive-lean-prover` | Plans, proofs, DAGs, logs and run state; under `.humanize/`. |
-| `wiki_dir` | `.humanize/math-wiki` | The theorem wiki; under `.humanize/`. |
+| `artifact_dir` | `.hmz/recursive-lean-prover` | Plans, proofs, DAGs, logs and run state; under `.hmz/`. |
+| `wiki_dir` | `.hmz/math-wiki` | The theorem wiki; under `.hmz/`. |
 | `stop_on_child_failure` | `true` | Block a parent when a required subproblem fails. |
 
 `comparator_command` may use the placeholders `{node_id}`, `{node_dir}`, `{run_dir}`,
@@ -234,12 +234,12 @@ a broad `pkill` when other experiments share the machine.
 At startup the flow prints its run directory. In a second terminal:
 
 ```sh
-run_dir="$(cat .humanize/recursive-lean-prover/LATEST)"
+run_dir="$(cat .hmz/recursive-lean-prover/LATEST)"
 watch -n 1 "sed -n '1,220p' \"$run_dir/DAG.md\""
 ```
 
 The same directory contains `dag.json` and `dag.mmd`. Each problem workspace owns a wiki indexed
-at `.humanize/math-wiki/README.md`. A theorem is published as soon as that node passes its
+at `.hmz/math-wiki/README.md`. A theorem is published as soon as that node passes its
 controller comparator and the fresh reviewer's independent rerun; publication does not wait for
 the root theorem or the rest of the problem. Pages include the natural proof, frozen scaffold,
 Lean source, recursion level, and comparator evidence.
@@ -301,7 +301,7 @@ descendant integration future before final acceptance.
 
 The official RLCR loop commits Lean changes as it works and runs coding agents with Humanize's
 permission prompting disabled. Plans, DAG state, comparator logs, and the wiki stay below
-`.humanize/` so they do not enter RLCR's git-clean gate. A stopped run is resumable: running the
+`.hmz/` so they do not enter RLCR's git-clean gate. A stopped run is resumable: running the
 same task again with `--resume` in the same repository reuses its durable run directory, node
 worktrees, already approved wiki pages, and nested RLCR state. Integrations of accepted
 candidates under way when a run stops are stopped too, never half way through changing the
@@ -325,7 +325,7 @@ The tests run the flow on fake agents over real git repositories, beside a stand
 from a checkout named by `HUMANIZE1_CHECKOUT`:
 
 ```sh
-git clone --branch v0.1.0 https://github.com/humanfia/flow-humanize1 .deps/flow-humanize1
+git clone --branch v0.1.1 https://github.com/humanfia/flow-humanize1 .deps/flow-humanize1
 HUMANIZE1_CHECKOUT=.deps/flow-humanize1 uv run pytest
 ```
 

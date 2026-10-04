@@ -1,6 +1,6 @@
 [project]
 name = "flow-recursive-lean-prover"
-version = "0.1.0"
+version = "0.1.1"
 description = "Recursive Lean Prover for hmz: recursively plan, prove, compare, review and catalogue Lean theorems."
 readme = "README.md"
 requires-python = ">=3.12"
