@@ -47,7 +47,7 @@ wheels = [
 [[package]]
 name = "hmz"
 version = "0.1.0"
-source = { git = "https://github.com/humanfia/humanize#a80519552e014d854e331046ecde70acdf088051" }
+source = { git = "https://github.com/humanfia/humanize#8f73e31c9232a7c2009e26d36c757711e394db18" }
 dependencies = [
     { name = "dateparser" },
     { name = "psutil" },
