@@ -1,4 +1,79 @@
+FETCH_ONE_PROBLEM = """You are the dedicated problem-acquisition session for one Lean-Eval run.
+Start from this catalog page, but do not enumerate, summarize, or select any other entry:
+{collection_url}
+
+The controller has already resolved the only permitted problem id: `{problem_id}`.
+Fetch only these two representations of that same problem:
+
+- Canonical page: {problem_url}
+- Canonical JSON: {problem_data_url}
+
+Use the local repository only to confirm that this id is the current experiment. Return one
+structured object, never a list. Its `problem_id`, `source_url`, and `data_url` must exactly match
+the values above. Copy `title`, `generated_at`, `problem.statement_revision`, and `problem.module`
+exactly from the JSON into their matching structured fields. Its `markdown` must be a faithful
+single-problem page, not a proof and not a multi-problem digest. It must follow this shape,
+preserving available leaderboard metadata, lifecycle, frozen sets, solution/replay entries,
+self-reported metadata, and data limitations:
+
+# <exact problem title>
+
+> Source: [Lean AI formalization leaderboard](<canonical problem URL>)
+> Crawled: <UTC date/time>
+> Leaderboard data generated: <timestamp from JSON>
+
+## Leaderboard entry
+
+| Field | Value |
+| --- | --- |
+| Problem id | `<the fixed problem id>` |
+| Group | ... |
+| Status | ... |
+| Statement revision | `<exact integer from JSON>` |
+| Author | ... |
+| Module | `<exact module from JSON>` |
+
+## Problem
+
+Include the official notes, source, and published informal guidance for this problem only.
+
+### Lifecycle
+...
+
+### Frozen sets
+...
+
+### Solutions and replay comparison
+...
+
+## Trusted local Lean contract
+
+Identify `Challenge.lean`, `config.json`, the repository `README.md`, and the configured submission
+target when present. State that the local challenge declarations and comparator remain the formal
+acceptance authority.
+
+## Data limitations
+...
+
+Do not write or edit files. The controller cross-checks your response against its independent v2
+download and atomically writes a canonical Markdown rendering of that complete record.
+Do not inspect any comparator-only source that the controller has removed from the agent
+workspace, including through Git objects/history, alternate worktrees, caches, parent directories,
+or comparator internals.
+
+User experiment request (selection context only):
+{request}
+"""
+
 PLAN_DRAFT = """# Recursive Lean theorem node
+
+## Frozen problem acquisition
+
+{problem_context}
+
+## Required research sources
+
+{reference_context}
 
 ## Mathematical task
 
@@ -63,6 +138,10 @@ is true, and show exactly how the lemmas imply the requested result. Named lemma
 become child DAG nodes, but they are not excuses for a gap: give their mathematical proofs here.
 Do not write Lean code and do not edit files.
 
+{problem_context}
+
+{reference_context}
+
 Theorem:
 {statement}
 
@@ -91,8 +170,27 @@ and later child workers formalize them. Do not reject this proof solely because 
 artifacts are absent. Do reject a missing mathematical hypothesis, proof, or non-circular
 dependency in the prose itself.
 
-Theorem:
-{statement}
+Exact review target (authoritative for this audit):
+- DAG node: `{node_id}`
+- Node title: {node_title}
+- Prose statement: {statement}
+- Lean declaration: `Submission.{lean_name}`
+- Frozen Lean proposition: `{lean_statement}`
+
+The official problem record below supplies provenance and root-level context. When the DAG node
+is not `root`, do not replace the exact child target above with the parent/root theorem and do not
+demand proof of sibling or downstream conclusions. Audit precisely the displayed node target.
+
+Set `requires_parent_revision` true only if this is a non-root child and you establish, with a
+complete concrete counterexample or contradiction in `contract_contradiction`, that the exact
+frozen child proposition itself is mathematically false or inconsistent. Never use that escape
+for a difficult proof, an incomplete submitted argument, a missing Mathlib/library theorem, or a
+formalization obstacle. For those ordinary failures, leave it false and request proof repairs.
+For the root node, always leave it false because there is no parent decomposition to revisit.
+
+{problem_context}
+
+{reference_context}
 
 Proof:
 {proof}
@@ -111,6 +209,10 @@ before child proof work begins. This type is frozen and later becomes the indepe
 side of the child comparator. Dependencies must be acyclic.
 Return no children when the theorem is already atomic or depth {depth} reached the limit
 {max_depth}. Do not use `sorry`, placeholders, or circular restatements of the parent.
+
+{problem_context}
+
+{reference_context}
 
 Parent theorem:
 {statement}
@@ -135,6 +237,10 @@ a full declaration, proof, placeholder, post-hoc alias type, or type that depend
 being implemented already. For a split, return exactly one node audit for every key. For an
 atomic theorem, return an empty node list and judge the no-split rationale.
 
+{problem_context}
+
+{reference_context}
+
 Parent theorem:
 {statement}
 
@@ -147,6 +253,10 @@ Proposed decomposition:
 
 RLCR_LEAN_TASK = """Formalize DAG node `{node_id}` only, following the accepted plan at
 `{plan_path}` and the natural-language proof at `{natural_path}`.
+
+{problem_context}
+
+{reference_context}
 
 Exact theorem:
 {statement}
@@ -173,7 +283,14 @@ Requirements:
   placeholder, a new axiom, or a candidate history absent from both the base and approved children.
 - Create or complete a globally named theorem for this node; do not hide it as a local `have`.
 - For a child node, its declaration must have exactly the frozen expected Lean type above.
-- Preserve the exact target, hypotheses, imports, and declarations.
+- Preserve the exact challenge target, hypotheses, imports, and trusted declarations. Participant
+  placeholder declarations for ancestors or unrelated nodes are not protected: if the configured
+  source-safety scan covers an inherited `sorry`/`admit` placeholder for a node that is not yet
+  proved, remove that placeholder declaration before comparison. Never replace it with a fake
+  proof, alter a trusted challenge file, or remove a comparator-approved declaration.
+- Comparator-only files deliberately absent from this worktree are outside the agent evidence
+  boundary. Do not recover or inspect them through Git objects/history, alternate worktrees,
+  caches, parent directories, or comparator internals.
 - No `sorry`, `admit`, new axioms, unsafe loopholes, or weakened replacement theorem.
 - Run `{comparator_command}` until it exits zero and contains `{comparator_success}`.
 - For a non-root node, that exact node comparator is the complete configured correctness gate.
@@ -198,6 +315,10 @@ forbidden unless you personally rerun the exact comparator command shown below. 
 diff and the named Lean files. Check for weakened statements, changed challenge files/imports,
 extra axioms, `sorry`/`admit`, declaration shadowing, or any mismatch with the mathematical
 statement. List every new or completed theorem belonging to this node for the wiki.
+
+{problem_context}
+
+{reference_context}
 
 Node: {node_id}
 Mathematical statement:
@@ -236,6 +357,10 @@ Lean histories. The mathematical plan, natural-language proof, frozen theorem st
 isolated Lean candidate are accepted checkpoints: do not regenerate, revise, or weaken any of
 them. Work only in the current integration worktree.
 
+{problem_context}
+
+{reference_context}
+
 Node: {node_id}
 Exact mathematical statement: {statement}
 Frozen expected Lean type (children only): {lean_statement}
@@ -263,6 +388,10 @@ theorem. You did not write the repair. Inspect the complete diff from the latest
 confirm that both accepted histories and the exact theorem remain present, and reject deletion,
 weakening, challenge changes, new axioms, `sorry`, `admit`, unsafe mechanisms, or prohibited
 imports. Do not edit files.
+
+{problem_context}
+
+{reference_context}
 
 Node: {node_id}
 Mathematical statement: {statement}

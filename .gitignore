@@ -221,3 +221,6 @@ __marimo__/
 
 # The checkout of humanize1 CI fetches for the contract test.
 .deps/
+
+# macOS Finder metadata
+.DS_Store

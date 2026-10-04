@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 from typing import Any, Literal, NotRequired
@@ -20,6 +21,7 @@ from hmz.flows import (
     Permission,
     PermissionKind,
     PermissionRequestHookAgentMixin,
+    RequirementError,
     ScratchDirEnvMixin,
     flow,
     load,
@@ -160,6 +162,19 @@ class Config(FlowParams):
         ge=1,
         description="seconds allowed for each independent comparator run",
     )
+    problem_id: str = Field(
+        default="",
+        description=(
+            "one Lean-Eval problem id; blank derives it from the task URL, workspace "
+            "README, or workspace directory"
+        ),
+    )
+    problem_fetch_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=8,
+        description="attempts in one dedicated session to fetch one valid problem page",
+    )
     artifact_dir: str = Field(
         default=".humanize/recursive-lean-prover",
         description="untracked directory for plans, proofs, DAGs, logs, and run state",
@@ -168,9 +183,27 @@ class Config(FlowParams):
         default=".humanize/math-wiki",
         description="Markdown wiki receiving every comparator-approved theorem",
     )
+    reference_dir: str = Field(
+        default=".humanize/math-reference-library",
+        description="untracked cache for the three mandatory reference repositories",
+    )
+    huggingface_token_env: str = Field(
+        default="HF_TOKEN",
+        description=(
+            "environment variable holding the Hugging Face read token; the value is "
+            "never written to params, prompts, manifests, or subprocess arguments"
+        ),
+    )
     lean_target: str = Field(
         default="",
         description="Lean file the worker must edit; blank lets it infer the project target",
+    )
+    agent_hidden_files: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "tracked comparator-only files removed from the main checkout and every "
+            "agent worktree before any agent session starts"
+        ),
     )
     comparator_command: str = Field(
         default="bash tools/check-with-comparator.sh",
@@ -187,7 +220,7 @@ class Config(FlowParams):
         description="block a parent when any required subproblem exhausts its attempts",
     )
 
-    @field_validator("artifact_dir", "wiki_dir")
+    @field_validator("artifact_dir", "wiki_dir", "reference_dir")
     @classmethod
     def _local_state(cls, value: str) -> str:
         normalized = value.strip().rstrip("/")
@@ -195,6 +228,33 @@ class Config(FlowParams):
             raise ValueError("must be a relative path below .humanize/")
         if ".." in normalized.split("/"):
             raise ValueError("must not contain '..'")
+        return normalized
+
+    @field_validator("problem_id")
+    @classmethod
+    def _problem_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if normalized and not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", normalized
+        ):
+            raise ValueError("must be blank or one Lean-Eval problem id")
+        return normalized
+
+    @field_validator("huggingface_token_env")
+    @classmethod
+    def _token_environment_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", normalized):
+            raise ValueError("must be an environment-variable name")
+        if normalized.casefold() in {
+            "codex_home",
+            "home",
+            "path",
+            "pwd",
+            "shell",
+            "user",
+        }:
+            raise ValueError("must not repurpose a common system environment variable")
         return normalized
 
     @field_validator("lean_target")
@@ -206,6 +266,29 @@ class Config(FlowParams):
         if normalized and not normalized.endswith(".lean"):
             raise ValueError("must name a .lean file")
         return normalized
+
+    @field_validator("agent_hidden_files")
+    @classmethod
+    def _relative_hidden_files(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        for value in values:
+            one = value.strip().rstrip("/")
+            parts = Path(one).parts
+            if (
+                not one
+                or not parts
+                or Path(one).is_absolute()
+                or ".." in parts
+                or parts[0] == ".git"
+            ):
+                raise ValueError(
+                    "entries must be relative file paths inside the repository and "
+                    "outside .git"
+                )
+            if one in normalized:
+                raise ValueError("entries must be unique")
+            normalized.append(one)
+        return tuple(normalized)
 
     @model_validator(mode="after")
     def _tree_fits(self) -> Config:
@@ -256,13 +339,22 @@ def _nested_rlcr_config(config: WorktreeRlcrConfig) -> dict[str, Any]:
     return forwarded
 
 
+def _require_explicit_rlcr_review_skip(rlcr: Any) -> None:
+    if "skip_code_review" not in rlcr.expected_params.model_fields:
+        raise RequirementError(
+            f"{RLCR} is too old: install a humanize1 whose rlcr exposes "
+            "skip_code_review, which keeps each node's review isolated"
+        )
+
+
 @flow(
     agents=Agents,
     envs=Envs,
     params=Config,
     resumable=True,
     description=(
-        "Recursive Lean proving with RLCR plans, comparator gates, a live DAG, and a wiki"
+        "Fetch one Lean-Eval problem, then recursively prove it with three reference "
+        "corpora, RLCR, comparator gates, a live DAG, and a wiki"
     ),
 )
 async def recursive_lean_prover(
@@ -307,6 +399,7 @@ async def worktree_rlcr(
         if source.is_file() and source.resolve() != manifest.resolve():
             shutil.copy2(source, manifest)
     rlcr = load(RLCR)
+    _require_explicit_rlcr_review_skip(rlcr)
     return await rlcr(
         task,
         agents={"builder": agents["worker"], "reviewer": agents["reviewer"]},
