@@ -63,6 +63,7 @@ offline-reproducible and prevents Lake from trying to update shared read-only Gi
   - [Review gates](#review-gates)
   - [DAG scheduling](#dag-scheduling)
   - [Safety and stopping](#safety-and-stopping)
+- [Maintainers](#maintainers)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -307,6 +308,10 @@ same task again with `--resume` in the same repository reuses its durable run di
 worktrees, already approved wiki pages, and nested RLCR state. Integrations of accepted
 candidates under way when a run stops are stopped too, never half way through changing the
 repository, and a resumed run integrates them.
+
+## Maintainers
+
+[@futrime](https://github.com/futrime), as listed in [`.github/CODEOWNERS`](.github/CODEOWNERS).
 
 ## Contributing
 
