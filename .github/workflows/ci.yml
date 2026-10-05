@@ -61,7 +61,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: humanfia/humanize1-flow
-          ref: v0.1.1
+          ref: v0.2.0
           path: .deps/humanize1-flow
           persist-credentials: false
 
