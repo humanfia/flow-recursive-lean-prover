@@ -116,7 +116,7 @@ To run a checkout of your own, keep `recursive_lean_prover` and `humanize1` side
 directory of flows and name the flow by its path:
 
 ```sh
-git clone --branch v0.1.2 https://github.com/humanfia/recursive-lean-prover-flow
+git clone --branch v0.2.0 https://github.com/humanfia/recursive-lean-prover-flow
 git clone --branch v0.2.0 https://github.com/humanfia/humanize1-flow
 mkdir -p flows
 cp -R recursive-lean-prover-flow/recursive_lean_prover humanize1-flow/humanize1 flows/
