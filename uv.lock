@@ -47,7 +47,7 @@ wheels = [
 [[package]]
 name = "hmz"
 version = "0.1.0"
-source = { git = "https://github.com/humanfia/humanize?rev=claude%2Fenv-at-run#11be6cc6b2f2411d1a3aae26416f65db269c0879" }
+source = { git = "https://github.com/humanfia/humanize#10f5f13cc47c194fb266cd8cdbf42fb8290874e3" }
 dependencies = [
     { name = "dateparser" },
     { name = "psutil" },
@@ -407,7 +407,7 @@ dev = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "hmz", git = "https://github.com/humanfia/humanize?rev=claude%2Fenv-at-run" },
+    { name = "hmz", git = "https://github.com/humanfia/humanize" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
     { name = "pytest-timeout", specifier = ">=2.3" },
