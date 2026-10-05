@@ -130,7 +130,7 @@ def record(name, task, agents, envs, params):
 async def gen_plan(task, *, agents, envs, params, ctx):
     record("gen-plan", task, agents, envs, params)
     planner, workspace = agents["planner"], envs["workspace"]
-    plan = await planner.run(task, session=await planner.spawn(env=workspace))
+    plan = await planner.run(task, session=await planner.spawn(), env=workspace)
     await workspace.write(params.output, plan.encode())
     return str(workspace.workdir / params.output)
 
@@ -139,7 +139,7 @@ async def gen_plan(task, *, agents, envs, params, ctx):
 async def rlcr(task, *, agents, envs, params, ctx):
     record("rlcr", task, agents, envs, params)
     builder = agents["builder"]
-    await builder.run(task, session=await builder.spawn(env=envs["workspace"]))
+    await builder.run(task, session=await builder.spawn(), env=envs["workspace"])
     return "complete"
 """
 

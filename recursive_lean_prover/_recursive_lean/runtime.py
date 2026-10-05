@@ -160,11 +160,11 @@ async def take_turn(agent: Any, prompt: str, schema_name: str, env: Any) -> Any:
     that failed waits a little before the step it belongs to tries again.
     """
     schema = getattr(models, schema_name) if schema_name else None
-    session = await agent.spawn(env=env)
+    session = await agent.spawn()
     try:
         if schema is None:
-            return await agent.run(prompt, session=session)
-        return await agent.run(prompt, session=session, output_schema=schema)
+            return await agent.run(prompt, session=session, env=env)
+        return await agent.run(prompt, session=session, env=env, output_schema=schema)
     except FAILED_TURN as error:
         print(f"[turn] {agent.role} answered nothing: {error}")
         if not isinstance(error, OutputSchemaError):
